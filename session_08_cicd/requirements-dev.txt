@@ -1,0 +1,11 @@
+# apache-airflow requires Python <3.13 — installs on CI (Python 3.11); DAG tests skip locally on 3.13
+apache-airflow==2.9.3
+apache-airflow-providers-common-sql==1.14.2
+duckdb==1.4.5
+pyspark==3.5.3
+pytest==8.3.4
+pytest-cov==5.0.0
+ruff==0.11.13
+bandit==1.8.3
+numpy>=1.26
+pandas>=1.5

@@ -1,0 +1,26 @@
+{
+  "_apply": "add the entries below to the matching sections of conf/trino/rules.json",
+  "catalogs": [
+    { "user": "marketing", "catalog": "delta", "allow": "all" },
+    { "user": "marketing", "catalog": "system", "allow": "read-only" }
+  ],
+  "schemas": [
+    { "user": "marketing", "catalog": "delta", "schema": ".*", "owner": false }
+  ],
+  "tables": [
+    {
+      "user": "marketing",
+      "catalog": "system",
+      "schema": ".*",
+      "table": ".*",
+      "privileges": ["SELECT"]
+    },
+    {
+      "user": "marketing",
+      "catalog": "delta",
+      "schema": ".*",
+      "table": ".*",
+      "privileges": ["SELECT"]
+    }
+  ]
+}

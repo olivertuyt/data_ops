@@ -1,0 +1,26 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  statsd-exporter:
+    image: prom/statsd-exporter:v0.26.1
+    ports:
+      - "9102:9102"
+      - "8125:9125/udp"
+    volumes:
+      - ./statsd/statsd.yaml:/etc/statsd/statsd.yaml
+    command: ["--statsd.mapping-config=/etc/statsd/statsd.yaml"]
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards

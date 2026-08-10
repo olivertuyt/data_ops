@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: anhnguyen1611/masterclass-dataops-postgres:v1.1.0
+    container_name: masterclass-dataops-postgres
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: shopvn
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_admin
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "shopvn"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+    networks:
+      - shopvn-net
+
+  api:
+    image: anhnguyen1611/masterclass-dataops-api:v1.1.0
+    container_name: masterclass-dataops-api
+    ports:
+      - "8000:8000"
+    environment:
+      API_KEY: shopvn-logistics-key-2026
+      RATE_LIMIT_PER_MIN: "100"
+      TIMEOUT_RATE: "0.05"
+      ERROR_RATE: "0.01"
+      NOT_FOUND_RATE: "0.08"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: shopvn
+      DB_USER: postgres
+      DB_PASSWORD: postgres_admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - shopvn-net
+
+  sftp:
+    image: anhnguyen1611/masterclass-dataops-sftp:v1.1.0
+    container_name: masterclass-dataops-sftp
+    ports:
+      - "2222:22"
+    restart: unless-stopped
+    networks:
+      - shopvn-net
+
+networks:
+  shopvn-net:
+    driver: bridge

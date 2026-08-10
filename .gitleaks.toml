@@ -1,0 +1,3 @@
+[allowlist]
+  description = "Demo-only infra credentials"
+  commits = ["75da2ae958f6bd18840d60463775793ea77c4725"]

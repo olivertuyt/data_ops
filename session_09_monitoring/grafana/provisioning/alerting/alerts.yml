@@ -1,0 +1,218 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: DataOps Alerts
+    folder: DataOps Alerts
+    interval: 60s
+    rules:
+
+      - uid: dataops-task-failure
+        title: DAG Task Failure
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus-ds
+            model:
+              datasource: {type: prometheus, uid: prometheus-ds}
+              expr: increase(af_agg_ti_failures[5m])
+              instant: true
+              refId: A
+          - refId: B
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: B
+              refId: C
+              type: threshold
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: NoData
+        execErrState: Alerting
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: A DAG task has failed — check Airflow task logs immediately.
+        isPaused: false
+
+      - uid: dataops-scheduler-dead
+        title: Scheduler Heartbeat Missing
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus-ds
+            model:
+              datasource: {type: prometheus, uid: prometheus-ds}
+              expr: increase(af_agg_scheduler_heartbeat[3m])
+              instant: true
+              refId: A
+          - refId: B
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: B
+              refId: C
+              type: threshold
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Airflow scheduler has not heartbeated in 3 minutes — it may be down.
+        isPaused: false
+
+      - uid: dataops-import-error
+        title: DAG Import Error
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus-ds
+            model:
+              datasource: {type: prometheus, uid: prometheus-ds}
+              expr: af_agg_dag_processing_import_errors
+              instant: true
+              refId: A
+          - refId: B
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: B
+              refId: C
+              type: threshold
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: NoData
+        execErrState: Alerting
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: One or more DAG files have parse errors — new DAGs will not be scheduled until fixed.
+        isPaused: false
+
+      - uid: dataops-executor-queue
+        title: Executor Queue Buildup
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus-ds
+            model:
+              datasource: {type: prometheus, uid: prometheus-ds}
+              expr: af_agg_executor_queued_tasks
+              instant: true
+              refId: A
+          - refId: B
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: B
+              refId: C
+              type: threshold
+              conditions:
+                - evaluator: {type: gt, params: [5]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: NoData
+        execErrState: Alerting
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: Executor has more than 5 tasks queued for 3+ minutes — workers may be bottlenecked.
+        isPaused: false
+
+      - uid: dataops-zombie-tasks
+        title: Zombie Tasks Detected
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus-ds
+            model:
+              datasource: {type: prometheus, uid: prometheus-ds}
+              expr: increase(af_agg_zombies_killed[10m])
+              instant: true
+              refId: A
+          - refId: B
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: "-100"
+            model:
+              datasource: {type: __expr__, uid: "-100"}
+              expression: B
+              refId: C
+              type: threshold
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+                  operator: {type: and}
+                  query: {params: [C]}
+                  reducer: {type: last, params: []}
+                  type: query
+        noDataState: NoData
+        execErrState: Alerting
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: Zombie tasks were killed in the last 10 minutes — check worker health.
+        isPaused: false

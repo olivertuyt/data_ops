@@ -1,0 +1,85 @@
+{
+  "catalogs": [
+    { "user": "admin", "catalog": "delta", "allow": "all" },
+    { "user": "admin", "catalog": "system", "allow": "all" },
+    { "user": "analyst", "catalog": "delta", "allow": "all" },
+    { "user": "analyst", "catalog": "system", "allow": "read-only" },
+    { "user": "analyst_uk|analyst_us", "catalog": "delta", "allow": "all" },
+    { "user": "analyst_uk|analyst_us", "catalog": "system", "allow": "read-only" },
+    { "catalog": ".*", "allow": "none" }
+  ],
+  "schemas": [
+    { "user": "admin", "catalog": "delta", "schema": ".*", "owner": true },
+    { "user": "analyst", "catalog": "delta", "schema": "silver|gold", "owner": false },
+    { "user": "analyst_uk|analyst_us", "catalog": "delta", "schema": "gold", "owner": false }
+  ],
+  "tables": [
+    {
+      "user": "admin|analyst|analyst_uk|analyst_us",
+      "catalog": "system",
+      "schema": ".*",
+      "table": ".*",
+      "privileges": ["SELECT"]
+    },
+    {
+      "user": "admin",
+      "catalog": "delta",
+      "schema": ".*",
+      "table": ".*",
+      "privileges": ["SELECT", "INSERT", "UPDATE", "DELETE", "OWNERSHIP"]
+    },
+    {
+      "user": "analyst",
+      "catalog": "delta",
+      "schema": "silver",
+      "table": "customers",
+      "privileges": ["SELECT"],
+      "columns": [
+        { "name": "full_name", "mask": "CAST(NULL AS varchar)" },
+        { "name": "phone", "mask": "regexp_replace(phone, '(\\d{3})\\d{4}(\\d{3})', '$1****$2')" },
+        { "name": "email", "mask": "regexp_replace(email, '(^[^@]{2})[^@]+(@.+)', '$1***$2')" },
+        { "name": "cccd", "mask": "CAST(NULL AS varchar)" },
+        { "name": "date_of_birth", "mask": "CAST(NULL AS date)" },
+        { "name": "address", "mask": "CAST(NULL AS varchar)" },
+        { "name": "account_balance", "mask": "CAST(NULL AS decimal(18,2))" },
+        { "name": "credit_score", "mask": "CAST(NULL AS integer)" }
+      ]
+    },
+    {
+      "user": "analyst",
+      "catalog": "delta",
+      "schema": "gold",
+      "table": "customer_analytics",
+      "privileges": ["SELECT"],
+      "columns": [
+        { "name": "phone", "mask": "regexp_replace(phone, '(\\d{3})\\d{4}(\\d{3})', '$1****$2')" },
+        { "name": "email", "mask": "regexp_replace(email, '(^[^@]{2})[^@]+(@.+)', '$1***$2')" },
+        { "name": "cccd", "mask": "CAST(NULL AS varchar)" }
+      ]
+    },
+    {
+      "user": "analyst_uk",
+      "catalog": "delta",
+      "schema": "gold",
+      "table": "customer_analytics",
+      "privileges": ["SELECT"],
+      "columns": [
+        { "name": "phone", "mask": "regexp_replace(phone, '(\\d{3})\\d{4}(\\d{3})', '$1****$2')" },
+        { "name": "email", "mask": "regexp_replace(email, '(^[^@]{2})[^@]+(@.+)', '$1***$2')" },
+        { "name": "cccd", "mask": "CAST(NULL AS varchar)" }
+      ]
+    },
+    {
+      "user": "analyst_us",
+      "catalog": "delta",
+      "schema": "gold",
+      "table": "customer_analytics",
+      "privileges": ["SELECT"],
+      "columns": [
+        { "name": "phone", "mask": "regexp_replace(phone, '(\\d{3})\\d{4}(\\d{3})', '$1****$2')" },
+        { "name": "email", "mask": "regexp_replace(email, '(^[^@]{2})[^@]+(@.+)', '$1***$2')" },
+        { "name": "cccd", "mask": "CAST(NULL AS varchar)" }
+      ]
+    }
+  ]
+}

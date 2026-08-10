@@ -1,0 +1,4 @@
+# The image only needs the Dockerfile (FROM + pip install, no COPY).
+# Keep the build context tiny — don't ship DAGs, SQL, or the DuckDB file to the builder.
+*
+!Dockerfile

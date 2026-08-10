@@ -1,0 +1,422 @@
+# Session 07 Security Demo — bronze/silver/gold PII pipeline with Vault-sourced
+# secrets and Trino column masking (admin vs analyst).
+# Reuses the Delta/S3A/Postgres jars already downloaded in session_05 (mounted read-only).
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__WEB_SERVER_PORT: '8888'
+    AIRFLOW__METRICS__STATSD_ON: 'true'
+    AIRFLOW__METRICS__STATSD_HOST: 'host.docker.internal'
+    AIRFLOW__METRICS__STATSD_PORT: '8125'
+    AIRFLOW__METRICS__STATSD_PREFIX: 'airflow'
+    # Airflow's native Vault secrets backend: connections and variables are
+    # resolved live from Vault, never stored in the metadata DB or DAG code.
+    AIRFLOW__SECRETS__BACKEND: airflow.providers.hashicorp.secrets.vault.VaultBackend
+    AIRFLOW__SECRETS__BACKEND_KWARGS: >-
+      {"connections_path": "airflow/connections", "variables_path": "airflow/variables",
+       "mount_point": "secret", "url": "http://vault:8200", "token": "root-demo-token"}
+    # Used directly by the reconcile() task to fetch the Trino admin password
+    # from Vault via hvac (Airflow's secrets backend only covers Connections).
+    VAULT_ADDR: "http://vault:8200"
+    VAULT_TOKEN: "root-demo-token"
+    # Self-signed CA cert exported by the trino container -- lets reconcile()
+    # verify TLS properly instead of verify=False.
+    TRINO_CA_CERT: /opt/trino-certs/trino.pem
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
+    AIRFLOW_CONN_DUCKDB_DEFAULT: '{"conn_type": "duckdb", "host": "/opt/airflow/db/dwh.duckdb"}'
+    AIRFLOW_CONN_SESSION_09_DUCKDB: '{"conn_type": "duckdb", "host": "/opt/airflow/dags/session_09/data/session_09.duckdb"}'
+    # Point PySpark (installed in the Airflow image) to the same spark-defaults.conf
+    # used by the Spark cluster, so the driver picks up spark.jars automatically.
+    SPARK_CONF_DIR: /opt/spark/conf
+  volumes:
+    - ./demo/dags:/opt/airflow/dags
+    - ./labs:/opt/airflow/dags/labs
+    - ./logs:/opt/airflow/logs
+    - ./demo/jobs:/opt/airflow/jobs
+    # Session 09 monitoring: deploy its data-quality DAG here so its runs emit
+    # StatsD metrics to the session_09 exporter. The whole demo/ tree is mounted
+    # so the DAG's relative paths to data/ and great_expectations/ resolve; an
+    # .airflowignore in that folder keeps data/ out of DAG parsing.
+    - ../session_09_monitoring/demo:/opt/airflow/dags/session_09
+    - ../plugins:/opt/airflow/plugins
+    - ./conf/trino/certs:/opt/trino-certs:ro
+    # Driver (airflow-worker) needs the Delta/S3A/Postgres JARs locally —
+    # spark.jars in spark-defaults.conf references /opt/jars and the driver
+    # must be able to read them to load DeltaSparkSessionExtension at startup.
+    - ../session_05_pyspark_lakehouse/jars:/opt/jars:ro
+    - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    - ./db:/opt/airflow/db
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    vault:
+      condition: service_healthy
+
+services:
+  # --- Airflow metadata store + broker -------------------------------------
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow", "-d", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  # --- Vault: source of truth for all application-level secrets -----------
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: s07-vault
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root-demo-token"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    ports:
+      - "8200:8200"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health?standbyok=true"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  vault-init:
+    image: hashicorp/vault:1.17
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root-demo-token"
+    volumes:
+      - ./vault-init/seed_secrets.sh:/seed_secrets.sh:ro
+    entrypoint: ["/bin/sh", "/seed_secrets.sh"]
+
+  # --- Operational source system (holds raw.customers with real PII) ------
+  postgres-source:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dataops_source
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-source-volume:/var/lib/postgresql/data
+      - ./sql/init_source.sql:/docker-entrypoint-initdb.d/init_source.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "dataops_source"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  postgres-seed:
+    image: python:3.11-slim
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      PGHOST: postgres-source
+      PGDATABASE: dataops_source
+      PGUSER: postgres
+      PGPASSWORD: postgres
+    command: >
+      /bin/sh -c "pip install --quiet --no-cache-dir psycopg2-binary==2.9.9 faker==26.0.0 &&
+      python /scripts/generate_customers.py --rows 200"
+
+  # --- MinIO (Delta lake storage) ------------------------------------------
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/bronze local/silver local/gold;
+        mc admin user add local etl-svc etl-svc-2026;
+        mc admin policy attach local readwrite --user etl-svc;
+        printf '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:ListBucket\",\"s3:GetBucketLocation\"],\"Resource\":[\"arn:aws:s3:::silver\",\"arn:aws:s3:::silver/*\",\"arn:aws:s3:::gold\",\"arn:aws:s3:::gold/*\"]}]}' > /tmp/trino-policy.json;
+        mc admin policy create local trino-policy /tmp/trino-policy.json;
+        mc admin user add local trino-svc trino-svc-2026;
+        mc admin policy attach local trino-policy --user trino-svc;
+        echo 'MinIO buckets and service accounts ready.';
+      "
+
+  # --- Hive Metastore -------------------------------------------------------
+  metastore-db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: hive
+      MYSQL_USER: hive
+      MYSQL_PASSWORD: hive
+      MYSQL_DATABASE: metastore
+    volumes:
+      - metastore-db-volume:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+  hive-metastore:
+    image: bitsondatadev/hive-metastore:latest
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./conf/hive-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml
+    environment:
+      METASTORE_DB_HOSTNAME: metastore-db
+    depends_on:
+      metastore-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9083"]
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    restart: always
+
+  # --- Spark cluster ---------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: s07-spark-master
+    user: root
+    entrypoint: >
+      /bin/bash -c "
+        pip install --quiet --no-cache-dir hvac==2.3.0 psycopg2-binary==2.9.9 &&
+        /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      "
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root-demo-token"
+      # Lets lab jobs under /labs import the shared security_utils.py in /jobs.
+      PYTHONPATH: /jobs
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./demo/jobs:/jobs
+      - ./labs:/labs:ro
+      - ./logs/audit:/var/log/pii_audit
+      - ../session_05_pyspark_lakehouse/jars:/opt/jars:ro
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      vault:
+        condition: service_healthy
+    restart: always
+
+  spark-worker:
+    image: apache/spark:3.5.0
+    user: root
+    entrypoint: >
+      /bin/bash -c "
+        pip install --quiet --no-cache-dir hvac==2.3.0 psycopg2-binary==2.9.9 &&
+        /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+      "
+    environment:
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_CORES: "2"
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root-demo-token"
+      PYTHONPATH: /jobs
+    volumes:
+      - ./demo/jobs:/jobs
+      - ./labs:/labs:ro
+      - ./logs/audit:/var/log/pii_audit
+      - ../session_05_pyspark_lakehouse/jars:/opt/jars:ro
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      - spark-master
+    restart: always
+
+  # --- Trino: file-based access control gives admin vs analyst different views ---
+  # The self-signed TLS keypair is generated ONCE into the bind-mounted
+  # conf/trino/certs/ dir (persists across restarts, so clients that pin
+  # trino.pem keep verifying successfully). SAN covers both in-network
+  # ("trino") and host ("localhost") names so Python/JDBC hostname
+  # verification passes.
+  trino:
+    image: trinodb/trino:445
+    entrypoint: ["/bin/bash", "-c", "if [ ! -f /etc/trino/certs/keystore.p12 ]; then keytool -genkeypair -alias trino -keyalg RSA -keysize 2048 -validity 3650 -dname 'CN=trino, OU=demo, O=dataops-from-scratch' -ext 'SAN=dns:trino,dns:localhost' -keystore /etc/trino/certs/keystore.p12 -storetype PKCS12 -storepass demo-keystore-password -keypass demo-keystore-password && keytool -exportcert -rfc -alias trino -keystore /etc/trino/certs/keystore.p12 -storepass demo-keystore-password -file /etc/trino/certs/trino.pem; fi && /usr/lib/trino/bin/run-trino"]
+    ports:
+      - "8092:8080"
+      - "8443:8443"
+    volumes:
+      - ./conf/trino/config.properties:/etc/trino/config.properties
+      - ./conf/trino/access-control.properties:/etc/trino/access-control.properties
+      - ./conf/trino/rules.json:/etc/trino/rules.json
+      - ./conf/trino/password-authenticator.properties:/etc/trino/password-authenticator.properties
+      - ./conf/trino/password.db:/etc/trino/password.db
+      - ./conf/trino/catalog/delta.properties:/etc/trino/catalog/delta.properties
+      - ./conf/trino/certs:/etc/trino/certs
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    restart: always
+
+  # --- Ad-hoc demo client: `docker compose exec demo-cli python /scripts/query_trino.py ...` ---
+  demo-cli:
+    image: python:3.11-slim
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./conf/trino/certs:/opt/trino-certs:ro
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root-demo-token"
+      TRINO_HOST: trino
+      TRINO_PORT: "8443"
+      TRINO_CA_CERT: /opt/trino-certs/trino.pem
+    command: >
+      /bin/sh -c "pip install --quiet --no-cache-dir trino==0.328.0 hvac==2.3.0 &&
+      tail -f /dev/null"
+    depends_on:
+      - trino
+      - vault
+
+  # --- Airflow (Celery) ------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username airflow \
+          --password airflow \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com
+        airflow pools set duckdb_pool 1 "DuckDB single-writer pool"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8888:8888"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8888/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
+  postgres-source-volume:
+  metastore-db-volume:
+  minio-data:

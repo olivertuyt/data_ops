@@ -1,0 +1,31 @@
+name: DataOps CD
+
+on:
+  workflow_run:
+    workflows: ["DataOps CI"]
+    types: [completed]
+    branches: [main, develop]
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: self-hosted
+    steps:
+      - name: Pull latest code
+        run: |
+          git -C ${{ vars.REPO_PATH }} fetch origin ${{ github.event.workflow_run.head_branch }}
+          git -C ${{ vars.REPO_PATH }} checkout origin/${{ github.event.workflow_run.head_branch }} -- session_08_cicd/demo/dags/
+
+      - name: Deploy DAG to Airflow
+        run: |
+          docker cp ${{ vars.REPO_PATH }}/session_08_cicd/demo/dags/session_08_order_pipeline.py \
+            session_07_security-airflow-webserver-1:/opt/airflow/dags/
+          docker cp ${{ vars.REPO_PATH }}/session_08_cicd/demo/dags/sql \
+            session_07_security-airflow-webserver-1:/opt/airflow/dags/
+
+      - name: Verify DAG loaded
+        run: |
+          sleep 90
+          curl -f -u "airflow:airflow" \
+            http://localhost:8888/api/v1/dags/session_08_order_pipeline \
+            | python3 -c "import sys, json; d=json.load(sys.stdin); assert d['is_active'], 'DAG not active'"

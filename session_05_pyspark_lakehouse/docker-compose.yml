@@ -1,0 +1,287 @@
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__WEB_SERVER_PORT: '8888'
+    # Spark connection used by SparkSubmitOperator (JSON form keeps the spark://
+    # scheme on the host so the hook builds master=spark://spark-master:7077).
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
+    # Jar paths as an Airflow Variable, read by the DAGs via Variable.get("spark_jars").
+    AIRFLOW_VAR_SPARK_JARS: /opt/jars/delta-spark_2.12-3.2.0.jar,/opt/jars/delta-storage-3.2.0.jar,/opt/jars/hadoop-aws-3.3.4.jar,/opt/jars/aws-java-sdk-bundle-1.12.262.jar
+    AIRFLOW__WEBSERVER__SHOW_TRIGGER_FORM_IF_NO_PARAMS: 'true'
+    # MinIO / S3A + Trino credentials as env vars — no literals in the job or DAG
+    # code. In production these would come from a secrets backend, not the image.
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    MINIO_ENDPOINT: http://minio:9000
+    TRINO_HOST: trino
+    TRINO_PORT: '8080'
+  volumes:
+    - ./demo/dags:/opt/airflow/dags/session_05_demo
+    - ./lab/dags:/opt/airflow/dags/session_05_lab
+    - ./homework/submissions:/opt/airflow/dags/session_05_homework
+    - ./demo/jobs:/opt/airflow/jobs/demo
+    - ./lab/jobs:/opt/airflow/jobs/lab
+    - ./homework/submissions:/opt/airflow/jobs/homework
+    - ./jobs:/opt/airflow/jobs/common
+    - ./logs:/opt/airflow/logs
+    - ./jars:/opt/jars
+    - ../plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow", "-d", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  metastore-db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: hive
+      MYSQL_USER: hive
+      MYSQL_PASSWORD: hive
+      MYSQL_DATABASE: metastore
+    volumes:
+      - metastore-db-volume:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+    restart: always
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/bronze;
+        mc mb --ignore-existing local/silver;
+        mc mb --ignore-existing local/gold;
+        echo 'Medallion buckets created: bronze, silver, gold.';
+      "
+
+  hive-metastore:
+    image: bitsondatadev/hive-metastore:latest
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./conf/hive-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml
+    environment:
+      METASTORE_DB_HOSTNAME: metastore-db
+    depends_on:
+      metastore-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/9083"]
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    restart: always
+
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark-master
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      MINIO_ENDPOINT: http://minio:9000
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./jobs:/jobs
+      # Non-overlapping paths: /opt/jobs/* are siblings, not nested under /jobs,
+      # so the bind mounts resolve reliably across container recreations.
+      - ./demo/jobs:/opt/jobs/demo
+      - ./lab/jobs:/opt/jobs/lab
+      - ./homework/submissions:/opt/jobs/homework
+      - ./jars:/opt/jars
+      # Jars + Delta/S3A defaults so `docker exec spark-master spark-submit|spark-sql`
+      # needs no --jars / --conf. Only on the master (where those commands run).
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    restart: always
+
+  spark-worker:
+    image: apache/spark:3.5.0
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_CORES: "2"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      MINIO_ENDPOINT: http://minio:9000
+    volumes:
+      - ./jobs:/jobs
+      # Non-overlapping paths: /opt/jobs/* are siblings, not nested under /jobs,
+      # so the bind mounts resolve reliably across container recreations.
+      - ./demo/jobs:/opt/jobs/demo
+      - ./lab/jobs:/opt/jobs/lab
+      - ./homework/submissions:/opt/jobs/homework
+      - ./jars:/opt/jars
+    depends_on:
+      - spark-master
+    restart: always
+
+  trino:
+    image: trinodb/trino:445
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./conf/trino/config.properties:/etc/trino/config.properties
+      - ./conf/trino/catalog/delta.properties:/etc/trino/catalog/delta.properties
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 15s
+      retries: 10
+      start_period: 30s
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username airflow \
+          --password airflow \
+          --firstname Airflow \
+          --lastname Admin \
+          --role Admin \
+          --email admin@example.com
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+    user: "0:0"
+    depends_on:
+      <<: *airflow-common-depends-on
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8888:8888"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8888/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    # Stable hostname so the client-mode Spark driver (which runs inside this
+    # container) is reachable by executors at spark.driver.host=airflow-worker.
+    hostname: airflow-worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:
+  metastore-db-volume:
+  minio-data:

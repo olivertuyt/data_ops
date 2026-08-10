@@ -1,0 +1,4 @@
+data/
+spark-events/
+logs/
+__pycache__/

@@ -1,0 +1,8 @@
+# Session 04 is DuckDB SQL (range(), strftime, MERGE INTO, list literals) — the
+# repo-root .sqlfluff uses the Trino dialect, which cannot parse it. This nested
+# config overrides the dialect for everything under session_04_sql_dwh/.
+[sqlfluff]
+dialect = duckdb
+templater = raw
+max_line_length = 100
+exclude_rules = LT05

@@ -1,0 +1,8 @@
+# Downloaded at setup time (see README), not committed — ~275 MB.
+jars/*.jar
+
+# Generated / runtime artifacts.
+data/
+logs/
+__pycache__/
+*.pyc

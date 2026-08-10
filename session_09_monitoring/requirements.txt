@@ -1,0 +1,7 @@
+# Local host deps for the Lab 2 runner and data generation (Python 3.9+).
+# The session_07 Airflow image installs its own GE/duckdb pins (see its Dockerfile).
+great-expectations==0.18.19
+duckdb==1.5.5
+pandas==2.2.2
+numpy==1.26.4
+pyarrow>=14.0

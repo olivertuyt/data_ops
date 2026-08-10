@@ -1,0 +1,9 @@
+# Python libraries for the Spark jobs and the DAG helpers.
+# Install locally for editing / IDE support / running a job outside Docker:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements_local.txt
+# The Airflow image (Dockerfile) installs these too, plus
+# apache-airflow-providers-apache-spark (which pulls in Airflow itself).
+pyspark==3.5.0
+minio==7.2.7
+trino==0.328.0

@@ -1,0 +1,55 @@
+# Session 2 demo — Airflow on Kubernetes (Minikube) via Helm
+# Chart: apache-airflow/airflow 1.15.0 (defaults to Airflow 2.9.3 — same version as the Docker Compose lab)
+#
+# Install:
+#   helm install airflow apache-airflow/airflow \
+#     --namespace airflow --create-namespace \
+#     --version 1.15.0 -f values-demo.yaml
+
+# CeleryExecutor to mirror the Docker Compose stack one-to-one (same executor,
+# same components: scheduler, webserver, worker, redis, metadata DB)
+executor: CeleryExecutor
+
+workers:
+  # Single worker for observation; horizontal scale demo:
+  #   helm upgrade airflow apache-airflow/airflow -n airflow \
+  #     --version 1.15.0 -f values-demo.yaml --set workers.replicas=2
+  replicas: 1
+  persistence:
+    # No PVC — faster pod startup, no storage class needed for the demo
+    enabled: false
+
+# Flower is disabled by default in the chart — enable it to compare with
+# the flower service in docker-compose
+flower:
+  enabled: true
+
+# STATIC secret key — without it, every `helm upgrade` generates a new random
+# key, forcing an unnecessary webserver/scheduler restart (and breaking the
+# port-forward mid-demo). Demo only; production must keep this in a Secret.
+webserverSecretKey: dataops-demo-static-secret-key
+
+config:
+  core:
+    load_examples: "False"
+
+# Bitnami removed old tags from docker.io/bitnami (moved to bitnamilegacy, ~late 2025).
+# Without this override postgres hits ImagePullBackOff ("manifest unknown").
+# bitnamilegacy images ship amd64 + arm64 (works on Apple Silicon).
+postgresql:
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/postgresql
+    tag: 16.1.0-debian-11-r15
+
+# ── GitOps (see the "GitOps for Airflow" slide) ─────────────────────────────
+# K8s pods can't see the local dags/ folder the way Docker Compose does.
+# gitSync makes every pod pull DAGs from Git — Git is the source of truth.
+# This is how DAGs actually get into the cluster; without it, Airflow is empty.
+dags:
+  gitSync:
+    enabled: true
+    repo: https://github.com/anhnguyen907/master-class-dataops.git
+    branch: main
+    subPath: session_02_airflow_intro/lab/dags
+    credentialsSecret: git-credentials

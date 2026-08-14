@@ -1,0 +1,172 @@
+name: shopvn-pipeline
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  env_file: ${SHOPVN_ENV_FILE:-.env}
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PLATFORM_DB_USER}:${PLATFORM_DB_PASSWORD}@platform-db:5432/airflow
+  networks: [pipeline-net, shopvn-net]
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./common:/opt/shopvn/common:ro
+    - ./jobs:/opt/shopvn/jobs:ro
+    - ./sql:/opt/shopvn/sql:ro
+    - api-landing:/opt/airflow/landing/api
+    - marketplace-landing:/opt/airflow/landing/marketplace
+  depends_on:
+    platform-db:
+      condition: service_healthy
+    polaris-setup:
+      condition: service_completed_successfully
+
+services:
+  platform-db:
+    image: postgres:16-alpine
+    env_file: ${SHOPVN_ENV_FILE:-.env}
+    environment:
+      POSTGRES_USER: ${PLATFORM_DB_USER}
+      POSTGRES_PASSWORD: ${PLATFORM_DB_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - platform-db-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks: [pipeline-net]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$PLATFORM_DB_USER -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z-cpuv1
+    command: server /data --console-address ":9001"
+    env_file: ${SHOPVN_ENV_FILE:-.env}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    networks: [pipeline-net]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  setup-bucket:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    env_file: ${SHOPVN_ENV_FILE:-.env}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mc alias set lake http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD && mc mb --ignore-existing lake/$$MINIO_BUCKET && mc ls lake
+    networks: [pipeline-net]
+    restart: "no"
+
+  polaris:
+    image: apache/polaris:1.7.0
+    env_file: ${SHOPVN_ENV_FILE:-.env}
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_DATABASE_TYPE: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://platform-db:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: ${PLATFORM_DB_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${PLATFORM_DB_PASSWORD}
+      POLARIS_BOOTSTRAP_CREDENTIALS: ${POLARIS_REALM},${POLARIS_CLIENT_ID},${POLARIS_CLIENT_SECRET}
+      POLARIS_REALM_CONTEXT_REALMS: ${POLARIS_REALM}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx512m
+      QUARKUS_OTEL_SDK_DISABLED: "true"
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+    depends_on:
+      platform-db:
+        condition: service_healthy
+      setup-bucket:
+        condition: service_completed_successfully
+    ports: ["8181:8181", "8182:8182"]
+    networks: [pipeline-net]
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8182/q/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  polaris-setup:
+    image: alpine/curl:8.21.0
+    env_file: ${SHOPVN_ENV_FILE:-.env}
+    volumes: ["./polaris/setup:/polaris:ro"]
+    entrypoint: ["/bin/sh", "/polaris/setup/setup.sh"]
+    depends_on:
+      polaris:
+        condition: service_healthy
+    networks: [pipeline-net]
+    restart: "no"
+
+  trino:
+    image: trinodb/trino:483
+    env_file: ${SHOPVN_ENV_FILE:-.env}
+    ports: ["8080:8080"]
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/etc/config.properties:/etc/trino/config.properties:ro
+      - ./trino/etc/jvm.config:/etc/trino/jvm.config:ro
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+    networks: [pipeline-net]
+    mem_limit: 1280m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow-common
+    command:
+      - bash
+      - -c
+      - airflow db migrate && (airflow users create --username admin --password "$${AIRFLOW_ADMIN_PASSWORD}" --firstname ShopVN --lastname Admin --role Admin --email admin@example.local || true)
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports: ["8081:8080"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    mem_limit: 512m
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      trino:
+        condition: service_healthy
+    mem_limit: 1792m
+
+networks:
+  pipeline-net:
+    driver: bridge
+  shopvn-net:
+    external: true
+    name: session_11_final_project_shopvn-net
+
+volumes:
+  platform-db-data:
+  minio-data:
+  api-landing:
+  marketplace-landing:

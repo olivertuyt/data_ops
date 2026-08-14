@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShopVN Final Project - Apache Iceberg Playbook</title>
+<style>
+:root{--bg:#0b1220;--panel:#111c33;--ink:#e5e7eb;--muted:#a8b3c7;--accent:#67e8f9;--ok:#86efac;--warn:#fde68a;--border:#2b3a57}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:1200px;margin:auto;padding:32px 24px 80px}h1,h2,h3{line-height:1.25;color:#fff}h1{font-size:2.2rem}h2{margin-top:42px;border-bottom:1px solid var(--border);padding-bottom:8px}h3{color:var(--accent);margin-top:28px}
+.lead,.note,.warning,.done{padding:16px 18px;border:1px solid var(--border);border-radius:10px;background:var(--panel);margin:16px 0}.note{border-left:4px solid var(--accent)}.warning{border-left:4px solid var(--warn)}.done{border-left:4px solid var(--ok)}
+pre{overflow:auto;background:#020617;border:1px solid var(--border);border-radius:8px;padding:16px;color:#dbeafe;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}code{color:#bae6fd}
+table{width:100%;border-collapse:collapse;margin:14px 0 24px;background:var(--panel)}th,td{border:1px solid var(--border);padding:9px;text-align:left;vertical-align:top}th{color:var(--accent)}.small{color:var(--muted);font-size:.92rem}.check{color:var(--ok)}a{color:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+<h1>ShopVN Final Project — Apache Iceberg Implementation Playbook</h1>
+<div class="lead">
+<p><strong>Mục tiêu:</strong> xây dựng Lakehouse local cho ShopVN bằng Apache Iceberg, Apache Polaris REST Catalog, MinIO, Spark, Trino và Airflow.</p>
+<p><strong>Phạm vi:</strong> đây là hướng dẫn để bạn tự triển khai và đối chiếu từng bước. Code trong file chỉ là code tham khảo; không phải pipeline đã được implement.</p>
+<p>RAM Docker tối đa: <strong>8 GB</strong>. Source Compose của session 11 giữ nguyên; pipeline dùng Compose riêng.</p>
+</div>
+
+<h2>1. Kiến trúc đã chốt</h2>
+<pre><code>PostgreSQL ─┐
+Logistics API ─┼─&gt; Airflow LocalExecutor ─&gt; Spark local[2] ─&gt; Bronze ─&gt; Silver
+Marketplace SFTP ┘                                                │
+                                                                   v
+                                              work candidate (không phải Gold)
+                                                                   │
+                                              blocking DQ + Trino reconciliation
+                                                                   │ PASS only
+                                                                   v
+                                                        MERGE Iceberg Gold
+
+Polaris REST quản lý catalog; MinIO lưu data/metadata; Trino query Gold.</code></pre>
+<table>
+<tr><th>Component</th><th>Version / quyết định</th><th>Vai trò</th></tr>
+<tr><td>Table format</td><td>Apache Iceberg 1.10.1</td><td>Table metadata, snapshots, schema evolution</td></tr>
+<tr><td>Catalog</td><td>Apache Polaris 1.7.0</td><td>REST Catalog</td></tr>
+<tr><td>Object storage</td><td>MinIO RELEASE.2025-07-23T15-54-02Z-cpuv1</td><td>S3-compatible warehouse</td></tr>
+<tr><td>Compute</td><td>Spark/PySpark 3.5.6, Scala 2.12</td><td>Ingestion/transformation</td></tr>
+<tr><td>Query</td><td>Trino 483</td><td>Business SQL/reconciliation</td></tr>
+<tr><td>Orchestration</td><td>Airflow 2.9.3</td><td>Schedule, retry, SLA, backfill</td></tr>
+</table>
+<div class="warning"><strong>Không dùng Delta:</strong> không dùng delta-spark, DeltaCatalog, Delta table path hoặc Delta-specific Spark config.</div>
+<div class="note"><strong>Data contract:</strong> Gold là analytics-serving layer cuối cùng, không có Data Mart phía sau. Vì vậy mọi blocking DQ và reconciliation phải PASS trước khi insert/MERGE Gold. Namespace <code>work</code> chỉ chứa candidate theo <code>run_id</code>, không cấp quyền cho analytics.</div>
+
+<h2>2. Step 0 — Kiểm tra Docker và giới hạn RAM</h2>
+<p>Docker Desktop phải chạy và được giới hạn ở 8192 MB:</p>
+<pre><code>docker version
+docker compose version
+docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}}'</code></pre>
+<p>Kiểm tra không gian:</p>
+<pre><code>Get-PSDrive -PSProvider FileSystem
+docker system df</code></pre>
+<p>Không chạy <code>docker system prune</code> ở giai đoạn này vì có thể xóa image/cache của các session khác.</p>
+<div class="done"><strong>Gate 0:</strong> Docker Engine hoạt động, Compose v2, Docker memory không vượt 8 GB.</div>
+
+<h2>3. Step 1 — Verify source environment</h2>
+<pre><code>cd "D:\Data Engineering\DataOps\master-class-dataops\session_11_final_project"
+docker compose config
+docker compose up -d
+docker compose ps</code></pre>
+<p>Kiểm tra port:</p>
+<pre><code>$ports = 5434,8000,2222
+foreach ($port in $ports) {
+  $r = Test-NetConnection localhost -Port $port -WarningAction SilentlyContinue
+  [PSCustomObject]@{ Port=$port; Open=$r.TcpTestSucceeded }
+}</code></pre>
+<p>Kiểm tra network thật:</p>
+<pre><code>docker network ls
+docker inspect masterclass-dataops-postgres --format '{{json .NetworkSettings.Networks}}'</code></pre>
+<p>Kiểm tra API:</p>
+<pre><code>$headers = @{ "X-API-Key"=$env:LOGISTICS_API_KEY }
+Invoke-RestMethod http://localhost:8000/health -Headers $headers
+Invoke-RestMethod http://localhost:8000/v1/shipments/ORD-20260601-00001 -Headers $headers</code></pre>
+<p>Kiểm tra PostgreSQL:</p>
+<pre><code>$env:PGPASSWORD=$env:SHOPVN_DB_PASSWORD
+psql -h localhost -p 5434 -U $env:SHOPVN_DB_USER -d shopvn -c "SELECT COUNT(*) FROM orders;"
+psql -h localhost -p 5434 -U $env:SHOPVN_DB_USER -d shopvn -c "SELECT order_date, COUNT(*) FROM orders GROUP BY order_date ORDER BY order_date;"
+Remove-Item Env:PGPASSWORD</code></pre>
+<div class="done"><strong>Gate 1:</strong> PostgreSQL healthy, API health pass, SFTP port mở, order counts hợp lý và source network name đã ghi lại.</div>
+
+<h2>4. Step 2 — Tạo cấu trúc pipeline</h2>
+<pre><code>pipeline/
+├── docker-compose.yml
+├── Dockerfile.airflow
+├── docker-compose.resources.yml
+├── .env.example
+├── config/versions.env
+├── db/init/
+├── polaris/setup/
+├── spark/conf/spark-defaults.conf
+├── spark/jobs/common/
+├── spark/jobs/ingestion/
+├── spark/jobs/silver/
+├── spark/jobs/gold/
+├── spark/jobs/quality/
+├── dags/
+├── trino/catalog/
+├── trino/etc/
+├── sql/reconciliation/
+├── tests/unit/
+├── tests/integration/
+├── runbooks/
+├── docs/evidence/
+└── requirements.txt</code></pre>
+<p>Pipeline Compose phải join external source network bằng tên lấy từ <code>docker inspect</code>. Không sửa fixture gốc; source limits được thêm qua Compose override riêng.</p>
+
+<h2>5. Step 3 — Khóa version và resource budget</h2>
+<pre><code># config/versions.env
+JAVA_VERSION=17
+PYTHON_VERSION=3.11
+SCALA_BINARY_VERSION=2.12
+SPARK_VERSION=3.5.6
+PYSPARK_VERSION=3.5.6
+ICEBERG_VERSION=1.10.1
+POLARIS_VERSION=1.7.0
+TRINO_VERSION=483
+AIRFLOW_VERSION=2.9.3
+AIRFLOW_TRINO_PROVIDER_VERSION=5.9.0
+MINIO_VERSION=RELEASE.2025-07-23T15-54-02Z-cpuv1
+MINIO_MC_VERSION=RELEASE.2025-08-13T08-35-41Z
+ICEBERG_SPARK_RUNTIME=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.1
+ICEBERG_AWS_BUNDLE=org.apache.iceberg:iceberg-aws-bundle:1.10.1</code></pre>
+<table>
+<tr><th>Service</th><th>Limit</th></tr>
+<tr><td>PostgreSQL source</td><td>768 MB</td></tr>
+<tr><td>API source</td><td>384 MB</td></tr>
+<tr><td>SFTP source</td><td>256 MB</td></tr>
+<tr><td>MinIO</td><td>512 MB</td></tr>
+<tr><td>Polaris</td><td>768 MB</td></tr>
+<tr><td>Trino</td><td>1280 MB</td></tr>
+<tr><td>Platform PostgreSQL</td><td>512 MB</td></tr>
+<tr><td>Airflow webserver</td><td>512 MB</td></tr>
+<tr><td>Airflow scheduler + Spark local job</td><td>1792 MB</td></tr>
+<tr><td>Prometheus + StatsD + Grafana</td><td>640 MB</td></tr>
+</table>
+<p class="small">Tổng hard limits khoảng 7 GB, còn khoảng 1 GB cho Docker overhead. Airflow <code>parallelism=2</code>, <code>max_active_runs=1</code>; Spark chạy trong scheduler bằng <code>local[2]</code>, chỉ một Spark task tại một thời điểm.</p>
+
+<h3>Source resource override</h3>
+<pre><code># docker-compose.resources.yml (đặt cạnh source docker-compose.yml)
+services:
+  postgres:
+    mem_limit: 768m
+    cpus: "0.75"
+  api:
+    mem_limit: 384m
+    cpus: "0.50"
+  sftp:
+    mem_limit: 256m
+    cpus: "0.25"</code></pre>
+<pre><code>docker compose -f docker-compose.yml -f docker-compose.resources.yml config
+docker compose -f docker-compose.yml -f docker-compose.resources.yml up -d
+docker stats --no-stream</code></pre>
+<div class="warning">Nếu source containers bị OOM ở mức trên, tăng đúng service bị thiếu RAM và giảm Trino khi không demo query. Không nâng Docker Desktop quá 8 GB.</div>
+
+<h2>6. Step 4 — Runtime Compose design</h2>
+<p>Không chạy Spark master/worker riêng. Custom Airflow image chứa Java 17, PySpark, JDBC driver và Iceberg packages; scheduler chạy <code>spark-submit --master local[2]</code>. Một PostgreSQL platform lưu Airflow metadata và Polaris JDBC metadata trong hai database riêng.</p>
+<pre><code>name: shopvn-pipeline
+
+x-airflow-common: &amp;airflow-common
+  build: {context: ., dockerfile: Dockerfile.airflow}
+  env_file: .env
+  networks: [pipeline-net, shopvn-net]
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./spark:/opt/shopvn/spark:ro
+    - ./sql:/opt/shopvn/sql:ro
+  depends_on:
+    platform-db: {condition: service_healthy}
+    polaris: {condition: service_healthy}
+
+services:
+  platform-db:
+    image: postgres:16-alpine
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${PLATFORM_DB_USER}
+      POSTGRES_PASSWORD: ${PLATFORM_DB_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - platform-db-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks: [pipeline-net]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$PLATFORM_DB_USER -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z-cpuv1
+    command: server /data --console-address ":9001"
+    env_file: .env
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    networks: [pipeline-net]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  setup-bucket:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    env_file: .env
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mc alias set lake http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &amp;&amp; mc mb --ignore-existing lake/$$MINIO_BUCKET &amp;&amp; mc ls lake"]
+    networks: [pipeline-net]
+    restart: "no"
+
+  polaris:
+    image: apache/polaris:1.7.0
+    env_file: .env
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_DATABASE_TYPE: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://platform-db:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: ${PLATFORM_DB_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${PLATFORM_DB_PASSWORD}
+      POLARIS_BOOTSTRAP_CREDENTIALS: ${POLARIS_REALM},${POLARIS_CLIENT_ID},${POLARIS_CLIENT_SECRET}
+      POLARIS_REALM_CONTEXT_REALMS: ${POLARIS_REALM}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx512m
+      QUARKUS_OTEL_SDK_DISABLED: "true"
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+    depends_on:
+      platform-db: {condition: service_healthy}
+      setup-bucket: {condition: service_completed_successfully}
+    ports: ["8181:8181", "8182:8182"]
+    networks: [pipeline-net]
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8182/q/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  polaris-setup:
+    image: alpine/curl:8.21.0
+    env_file: .env
+    volumes: ["./polaris/setup:/polaris:ro"]
+    entrypoint: ["/bin/sh", "/polaris/setup.sh"]
+    depends_on:
+      polaris: {condition: service_healthy}
+    networks: [pipeline-net]
+    restart: "no"
+
+  trino:
+    image: trinodb/trino:483
+    ports: ["8080:8080"]
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/etc/config.properties:/etc/trino/config.properties:ro
+      - ./trino/etc/jvm.config:/etc/trino/jvm.config:ro
+    depends_on:
+      polaris-setup: {condition: service_completed_successfully}
+    networks: [pipeline-net]
+    mem_limit: 1280m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    &lt;&lt;: *airflow-common
+    command: ["bash", "-c", "airflow db migrate &amp;&amp; (airflow users create --username admin --password $$AIRFLOW_ADMIN_PASSWORD --firstname ShopVN --lastname Admin --role Admin --email admin@example.local || echo 'admin already exists')"]
+    restart: "no"
+
+  airflow-webserver:
+    &lt;&lt;: *airflow-common
+    command: webserver
+    ports: ["8081:8080"]
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+    mem_limit: 512m
+
+  airflow-scheduler:
+    &lt;&lt;: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init: {condition: service_completed_successfully}
+      trino: {condition: service_healthy}
+    mem_limit: 1792m
+
+networks:
+  pipeline-net: {driver: bridge}
+  shopvn-net:
+    external: true
+    name: session_11_final_project_shopvn-net
+
+volumes:
+  platform-db-data:
+  minio-data:</code></pre>
+<div class="warning"><strong>Compose trên là reference skeleton:</strong> xác minh image 1.7.0 có JDBC support và các biến môi trường bằng <code>docker compose config</code> cùng Polaris logs. <code>setup.sh</code> phải idempotent: HTTP conflict vì catalog đã tồn tại được xem là already configured, còn 401/403/5xx phải fail. Chỉ PASS sau restart-persistence test.</div>
+
+<h3>Custom Airflow runtime</h3>
+<pre><code># Dockerfile.airflow — reference
+FROM apache/airflow:2.9.3-python3.11
+
+USER root
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+      openjdk-17-jre-headless curl &amp;&amp; \
+    rm -rf /var/lib/apt/lists/* &amp;&amp; mkdir -p /opt/airflow/jars
+
+ARG ICEBERG_VERSION=1.10.1
+ARG POSTGRES_JDBC_VERSION=42.7.5
+RUN curl -fsSL -o /opt/airflow/jars/iceberg-spark-runtime.jar \
+      https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar &amp;&amp; \
+    curl -fsSL -o /opt/airflow/jars/iceberg-aws-bundle.jar \
+      https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar &amp;&amp; \
+    curl -fsSL -o /opt/airflow/jars/postgresql.jar \
+      https://repo1.maven.org/maven2/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar
+
+USER airflow
+RUN pip install --no-cache-dir \
+      pyspark==3.5.6 \
+      apache-airflow-providers-trino==5.9.0 \
+      requests==2.32.3 paramiko==3.5.1
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PYSPARK_SUBMIT_ARGS="--jars /opt/airflow/jars/iceberg-spark-runtime.jar,/opt/airflow/jars/iceberg-aws-bundle.jar,/opt/airflow/jars/postgresql.jar pyspark-shell"</code></pre>
+<p>Build phải fail nếu download JAR lỗi. Sau build chạy <code>java -version</code>, <code>spark-submit --version</code>, Python import test và kiểm tra ba JAR tồn tại. Nếu provider version xung đột Airflow constraints, pin provider version tương thích theo output resolver; không dùng <code>pip install --upgrade apache-airflow</code>.</p>
+
+<h2>7. Step 5 — Environment và MinIO</h2>
+<pre><code># .env.example — placeholders only; copy thành .env và đổi giá trị
+PLATFORM_DB_USER=platform_admin
+PLATFORM_DB_PASSWORD=&lt;set-local-secret&gt;
+AIRFLOW_DB_NAME=airflow
+POLARIS_DB_NAME=polaris
+AIRFLOW_ADMIN_PASSWORD=&lt;set-local-secret&gt;
+AIRFLOW__CORE__EXECUTOR=LocalExecutor
+AIRFLOW__CORE__PARALLELISM=2
+AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=2
+AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://platform_admin:&lt;secret&gt;@platform-db:5432/airflow
+AIRFLOW_CONN_TRINO_SHOPVN=trino://airflow@trino:8080/shopvn/gold
+MINIO_ROOT_USER=&lt;set-local-user&gt;
+MINIO_ROOT_PASSWORD=&lt;set-local-secret&gt;
+MINIO_BUCKET=shopvn-lakehouse
+MINIO_ENDPOINT=http://minio:9000
+ICEBERG_WAREHOUSE=shopvn_catalog
+POLARIS_REALM=SHOPVN
+POLARIS_CLIENT_ID=root
+POLARIS_CLIENT_SECRET=&lt;set-local-secret&gt;
+QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://platform-db:5432/polaris
+QUARKUS_DATASOURCE_USERNAME=platform_admin
+QUARKUS_DATASOURCE_PASSWORD=&lt;set-local-secret&gt;
+POLARIS_PERSISTENCE_TYPE=relational-jdbc
+SHOPVN_DB_HOST=postgres
+SHOPVN_DB_PORT=5432
+SHOPVN_DB_NAME=shopvn
+SHOPVN_DB_USER=&lt;source-readonly-user&gt;
+SHOPVN_DB_PASSWORD=&lt;source-readonly-password&gt;
+LOGISTICS_API_URL=http://api:8000
+LOGISTICS_API_KEY=&lt;source-api-key&gt;
+SFTP_HOST=sftp
+SFTP_PORT=22
+SFTP_USER=&lt;source-readonly-user&gt;
+SFTP_PASSWORD=&lt;source-readonly-password&gt;</code></pre>
+<h3>Platform database init</h3>
+<pre><code>#!/bin/sh
+# db/init/01-create-databases.sh — chạy chỉ khi volume DB mới
+set -eu
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres &lt;&lt;-SQL
+  CREATE DATABASE airflow;
+  CREATE DATABASE polaris;
+SQL</code></pre>
+<p>Init script chỉ chạy khi volume mới. Nếu database đã tồn tại, không xóa volume để “fix” tùy tiện; kiểm tra bằng <code>psql</code> và dùng migration/bootstrap idempotent.</p>
+<pre><code>docker compose config
+docker compose up -d minio polaris
+docker compose ps
+docker compose logs polaris</code></pre>
+<p>Tạo bucket bằng <code>mc</code> hoặc một one-shot setup service; dùng credentials từ <code>.env</code>:</p>
+<pre><code>mc alias set local http://localhost:9000 &lt;MINIO_ROOT_USER&gt; &lt;MINIO_ROOT_PASSWORD&gt;
+mc mb local/shopvn-lakehouse
+mc ls local</code></pre>
+<h3>Polaris persistent bootstrap checklist</h3>
+<ol>
+<li>Init script tạo hai database <code>airflow</code> và <code>polaris</code> trong platform PostgreSQL.</li>
+<li><code>polaris-bootstrap</code> chạy idempotently với cùng JDBC config như Polaris server.</li>
+<li>Lấy OAuth token bằng root principal.</li>
+<li>Tạo internal catalog <code>shopvn_catalog</code> với base location <code>s3://shopvn-lakehouse/warehouse</code>, endpoint client/internal đều là <code>http://minio:9000</code> vì mọi client chạy trong Docker.</li>
+<li>Grant <code>CATALOG_MANAGE_CONTENT</code> cho catalog admin role. Với homework local có thể dùng bootstrap principal cho Spark và khóa Trino bằng <code>iceberg.security=READ_ONLY</code>; ghi rõ đây không phải production IAM.</li>
+<li>Restart Polaris và chứng minh catalog vẫn tồn tại.</li>
+</ol>
+<pre><code>curl --fail-with-body -X POST http://localhost:8181/api/catalog/v1/oauth/tokens \
+  -d "grant_type=client_credentials" \
+  -d "client_id=&lt;POLARIS_CLIENT_ID&gt;" \
+  -d "client_secret=&lt;POLARIS_CLIENT_SECRET&gt;" \
+  -d "scope=PRINCIPAL_ROLE:ALL"</code></pre>
+<h3>Catalog setup script tham khảo</h3>
+<pre><code>#!/bin/sh
+set -eu
+apk add --no-cache jq &gt;/dev/null
+
+TOKEN=$(curl -sS --fail-with-body \
+  -u "$POLARIS_CLIENT_ID:$POLARIS_CLIENT_SECRET" \
+  -H "Polaris-Realm: $POLARIS_REALM" \
+  -d grant_type=client_credentials \
+  -d scope=PRINCIPAL_ROLE:ALL \
+  http://polaris:8181/api/catalog/v1/oauth/tokens | jq -r .access_token)
+
+STATUS=$(curl -sS -o /tmp/catalog.json -w '%{http_code}' \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Polaris-Realm: $POLARIS_REALM" \
+  http://polaris:8181/api/management/v1/catalogs/shopvn_catalog)
+
+if [ "$STATUS" = "404" ]; then
+  curl -sS --fail-with-body -X POST \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Polaris-Realm: $POLARIS_REALM" \
+    -H "Content-Type: application/json" \
+    http://polaris:8181/api/management/v1/catalogs \
+    -d '{"catalog":{"name":"shopvn_catalog","type":"INTERNAL",
+      "readOnly":false,
+      "properties":{"default-base-location":"s3://shopvn-lakehouse/warehouse"},
+      "storageConfigInfo":{"storageType":"S3",
+        "endpoint":"http://minio:9000",
+        "endpointInternal":"http://minio:9000",
+        "pathStyleAccess":true,"region":"us-east-1"}}}'
+elif [ "$STATUS" != "200" ]; then
+  cat /tmp/catalog.json
+  exit 1
+fi
+
+GRANT_STATUS=$(curl -sS -o /tmp/grant.json -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Polaris-Realm: $POLARIS_REALM" \
+  -H "Content-Type: application/json" \
+  http://polaris:8181/api/management/v1/catalogs/shopvn_catalog/catalog-roles/catalog_admin/grants \
+  -d '{"type":"catalog","privilege":"CATALOG_MANAGE_CONTENT"}')
+case "$GRANT_STATUS" in
+  200|201|204|409) ;;
+  *) cat /tmp/grant.json; exit 1 ;;
+esac</code></pre>
+<p class="small">Script dựa trên Management API pattern chính thức. Nếu Polaris 1.7 trả status/body khác, giữ nguyên mục tiêu idempotency nhưng điều chỉnh theo log và API của đúng image; không bỏ qua 401/403/5xx.</p>
+<div class="done"><strong>Gate 5:</strong> MinIO bucket tồn tại; Polaris catalog đã setup; OAuth hoạt động; restart Polaris không làm mất catalog registration.</div>
+
+<h2>8. Step 6 — Spark Iceberg configuration</h2>
+<pre><code># spark/conf/spark-defaults.conf
+spark.master=local[2]
+spark.driver.memory=768m
+spark.sql.shuffle.partitions=4
+spark.default.parallelism=2
+spark.sql.adaptive.enabled=true
+spark.sql.session.timeZone=Asia/Ho_Chi_Minh
+spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.polaris.type=rest
+spark.sql.catalog.polaris.uri=http://polaris:8181/api/catalog
+spark.sql.catalog.polaris.warehouse=shopvn_catalog
+spark.sql.catalog.polaris.token-refresh-enabled=false
+spark.sql.catalog.polaris.scope=PRINCIPAL_ROLE:ALL
+spark.sql.catalog.polaris.header.X-Iceberg-Access-Delegation=vended-credentials
+spark.sql.catalog.polaris.credential=&lt;POLARIS_CLIENT_ID&gt;:&lt;POLARIS_CLIENT_SECRET&gt;
+spark.sql.catalog.polaris.cache-enabled=true</code></pre>
+<p>Không đặt MinIO root keys trong Spark config nếu dùng Polaris vended credentials. Inject Polaris credential lúc runtime từ environment/Airflow Connection; không commit secret vào <code>spark-defaults.conf</code>.</p>
+<p>Artifact bắt buộc:</p>
+<pre><code>org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.10.1
+org.apache.iceberg:iceberg-aws-bundle:1.10.1</code></pre>
+
+<h2>9. Step 7 — Compatibility smoke test</h2>
+<pre><code># spark/jobs/compatibility_smoke_test.py
+import os
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder
+    .appName("shopvn-iceberg-compatibility")
+    .config("spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.polaris",
+            "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.polaris.type", "rest")
+    .config("spark.sql.catalog.polaris.uri",
+            "http://polaris:8181/api/catalog")
+    .config("spark.sql.catalog.polaris.warehouse", "shopvn_catalog")
+    .config("spark.sql.catalog.polaris.scope", "PRINCIPAL_ROLE:ALL")
+    .config("spark.sql.catalog.polaris.credential",
+            f"{os.environ['POLARIS_CLIENT_ID']}:{os.environ['POLARIS_CLIENT_SECRET']}")
+    .config("spark.sql.catalog.polaris.header.X-Iceberg-Access-Delegation",
+            "vended-credentials")
+    .getOrCreate()
+)
+
+spark.sql("CREATE NAMESPACE IF NOT EXISTS polaris.compatibility_test")
+spark.sql("""
+CREATE TABLE IF NOT EXISTS polaris.compatibility_test.probe (
+  id BIGINT, message STRING
+) USING iceberg TBLPROPERTIES ('format-version'='2')
+""")
+spark.sql("INSERT INTO polaris.compatibility_test.probe VALUES (1, 'ok')")
+spark.sql("SELECT * FROM polaris.compatibility_test.probe").show()
+spark.sql("SELECT * FROM polaris.compatibility_test.probe.history").show()
+spark.sql("SELECT * FROM polaris.compatibility_test.probe.snapshots").show()
+spark.stop()</code></pre>
+<p>Trino phải đọc được cùng table:</p>
+<pre><code>SHOW CATALOGS;
+SHOW SCHEMAS FROM shopvn;
+SHOW TABLES FROM shopvn.compatibility_test;
+SELECT * FROM shopvn.compatibility_test.probe;</code></pre>
+<div class="done"><strong>Gate 7:</strong> Spark tạo/ghi/đọc table; metadata xuất hiện ở MinIO; Trino đọc cùng table; history/snapshots truy vấn được.</div>
+
+<h2>10. Step 8 — Trino Iceberg catalog</h2>
+<pre><code># trino/etc/jvm.config
+-server
+-Xmx768M
+-XX:+UseG1GC
+
+# trino/etc/config.properties
+coordinator=true
+node-scheduler.include-coordinator=true
+http-server.http.port=8080
+discovery.uri=http://trino:8080
+query.max-memory=512MB
+query.max-memory-per-node=384MB
+memory.heap-headroom-per-node=128MB</code></pre>
+<pre><code># trino/catalog/shopvn.properties
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://polaris:8181/api/catalog
+iceberg.rest-catalog.warehouse=shopvn_catalog
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.oauth2.credential=${ENV:POLARIS_CLIENT_ID}:${ENV:POLARIS_CLIENT_SECRET}
+iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+iceberg.rest-catalog.vended-credentials-enabled=true
+iceberg.rest-catalog.nested-namespace-enabled=false
+iceberg.security=READ_ONLY
+fs.s3.enabled=true
+s3.endpoint=http://minio:9000
+s3.region=us-east-1
+s3.path-style-access=true</code></pre>
+<p>Trino là query/reconciliation engine nên đặt <code>iceberg.security=READ_ONLY</code>. Không copy Spark Iceberg JAR vào Trino và không cấp MinIO root credentials cho Trino; storage access đi qua vended credentials.</p>
+
+<h2>11. Step 9 — Namespaces và audit tables</h2>
+<pre><code>CREATE NAMESPACE IF NOT EXISTS polaris.bronze;
+CREATE NAMESPACE IF NOT EXISTS polaris.silver;
+CREATE NAMESPACE IF NOT EXISTS polaris.work;
+CREATE NAMESPACE IF NOT EXISTS polaris.gold;
+CREATE NAMESPACE IF NOT EXISTS polaris.audit;
+
+CREATE TABLE IF NOT EXISTS polaris.audit.pipeline_runs (
+  run_id STRING, dag_id STRING, business_date DATE, layer STRING,
+  target_table STRING, status STRING, row_count BIGINT,
+  amount_sum DECIMAL(18,2), started_at TIMESTAMP,
+  completed_at TIMESTAMP, error_message STRING
+) USING iceberg
+PARTITIONED BY (days(business_date));</code></pre>
+<p>Dùng flat namespaces để giảm cấu hình cross-engine: Spark catalog là <code>polaris</code>, Trino catalog là <code>shopvn</code>; cùng schema <code>bronze/silver/work/gold/audit</code>. Thêm audit tables: <code>source_manifests</code>, <code>dq_results</code>, <code>reconciliation_results</code>, <code>api_errors</code>, <code>schema_changes</code>.</p>
+
+<h2>12. Step 10 — Thứ tự vertical slices</h2>
+<table>
+<tr><th>Thứ tự</th><th>Slice</th><th>Phụ thuộc</th><th>Kiểm chứng chính</th></tr>
+<tr><td>1</td><td>Finance</td><td>PostgreSQL + SFTP</td><td>Revenue, refund, settlement, reconciliation, idempotency</td></tr>
+<tr><td>2</td><td>Operations</td><td>Orders + API</td><td>429, timeout, 404, 500, LEFT JOIN</td></tr>
+<tr><td>3</td><td>Customer/Marketing</td><td>PostgreSQL</td><td>SCD2, voucher, lifecycle, PII</td></tr>
+<tr><td>4</td><td>Inventory/Product</td><td>Products + transactions + SFTP</td><td>Daily snapshot, sell-through, loss flag</td></tr>
+</table>
+<p>Không chuyển slice khi slice trước chưa có DQ, reconciliation, rerun và evidence.</p>
+
+<h2>13. Step 11 — PostgreSQL Bronze</h2>
+<p>Hybrid strategy: current dimensions snapshot+merge; orders/events incremental theo date/timestamp; Bronze thêm metadata nhưng chưa áp business rules.</p>
+<table>
+<tr><th>Table</th><th>Initial</th><th>Daily strategy</th><th>Lý do</th></tr>
+<tr><td>customers, products, vouchers, inventory</td><td>Full snapshot</td><td>Full snapshot + MERGE/hash compare</td><td>Nhỏ, current-state, không có reliable updated_at đồng nhất</td></tr>
+<tr><td>orders</td><td>Full</td><td>Sliding re-extract 30 ngày + MERGE; backfill explicit range</td><td>Status/payment có thể đổi nhưng không có updated_at</td></tr>
+<tr><td>order_items</td><td>Full</td><td>Theo orders trong sliding window + MERGE</td><td>Giữ consistency với orders</td></tr>
+<tr><td>returns, product_reviews, inventory_transactions</td><td>Full</td><td>Watermark theo <code>created_at</code> có overlap 1 ngày + key MERGE</td><td>Append-oriented nhưng overlap bảo vệ late records</td></tr>
+</table>
+<p>Watermark chỉ advance sau Bronze commit và reconciliation thành công. Lưu <code>last_successful_watermark</code> trong audit table; không dựa vào thời gian hiện tại của container.</p>
+<pre><code>from datetime import datetime, timezone
+from pyspark.sql import functions as F
+
+TABLES = {
+  "customers":"customer_id", "products":"product_id",
+  "orders":"order_id", "order_items":"item_id",
+  "vouchers":"voucher_code", "inventory":"product_id",
+  "inventory_transactions":"txn_id", "returns":"return_id",
+  "product_reviews":"review_id"
+}
+
+def read_table(spark, table_name, cfg):
+    url = f"jdbc:postgresql://{cfg['host']}:{cfg['port']}/{cfg['db']}"
+    return (spark.read.format("jdbc").option("url", url)
+      .option("dbtable", table_name)
+      .option("user", cfg["user"]).option("password", cfg["password"])
+      .option("driver", "org.postgresql.Driver")
+      .option("fetchsize", 10000).load())
+
+def add_metadata(df, table_name, run_id):
+    return (df.withColumn("_source_system", F.lit("postgresql"))
+      .withColumn("_source_table", F.lit(table_name))
+      .withColumn("_run_id", F.lit(run_id))
+      .withColumn("_ingested_at", F.current_timestamp()))
+
+# Implementation step: write work staging, validate, then MERGE into
+# polaris.bronze.postgres_<table_name></code></pre>
+<p>Output cần ghi: source count, Bronze count, null primary keys, duplicate keys, run_id, status.</p>
+
+<h2>14. Step 12 — SFTP Bronze và checksum</h2>
+<pre><code>import hashlib
+
+def md5_stream(path, chunk_size=1024*1024):
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def verify_md5(csv_path, md5_path):
+    expected = open(md5_path, encoding="utf-8").read().strip().split()[0]
+    actual = md5_stream(csv_path)
+    return expected.lower() == actual.lower(), expected, actual</code></pre>
+<table>
+<tr><th>Status</th><th>Hành động</th></tr>
+<tr><td>MISSING</td><td>Warning, skip partner/date, ghi manifest</td></tr>
+<tr><td>CORRUPT</td><td>Reject file, alert, không load</td></tr>
+<tr><td>LATE</td><td>Thiết kế sensor/rerun; kiểm thử conceptual</td></tr>
+<tr><td>VALID</td><td>Đọc CSV, schema check, MERGE Bronze</td></tr>
+</table>
+<p>Natural key marketplace: <code>partner + external_order_id + shopvn_product_id + order_date</code>. Không join external_order_id với PostgreSQL order_id.</p>
+<p>Download vào file tạm <code>.part</code> trên mounted landing directory, tính MD5 theo chunk, chỉ rename thành <code>.ready</code> khi hợp lệ; Spark chỉ đọc <code>*.ready</code>. Không gọi <code>file.read()</code> cho toàn bộ file. Manifest unique key là <code>partner + business_date + file_name + expected_md5</code>, nên rerun cùng file không duplicate nhưng file corrected với checksum mới vẫn được xử lý.</p>
+
+<h2>15. Step 13 — API Bronze</h2>
+<pre><code>429     =&gt; wait retry_after, retry
+timeout =&gt; retry 1s, 2s, 4s; tối đa 3 lần
+404     =&gt; log not_found, không retry
+500     =&gt; retry 1 lần, sau đó skip/log
+400     =&gt; client bug nếu batch &gt; 50</code></pre>
+<pre><code>import time
+import requests
+
+def call_batch(session, base_url, api_key, order_ids):
+    if not order_ids or len(order_ids) &gt; 50:
+        raise ValueError("batch size must be 1..50")
+    timeout_retries = 0
+    server_retries = 0
+    while True:
+        try:
+            r = session.post(
+                f"{base_url}/v1/shipments/batch",
+                headers={"X-API-Key": api_key},
+                json={"order_ids": order_ids},
+                timeout=(5, 35),
+            )
+        except requests.Timeout:
+            if timeout_retries &gt;= 3:
+                return {"status":"timeout_exhausted", "order_ids":order_ids}
+            time.sleep([1, 2, 4][timeout_retries])
+            timeout_retries += 1
+            continue
+
+        if r.status_code == 200:
+            # not_found IDs thường nằm trong payload 200; ghi riêng vào audit.
+            return {"status":"success", **r.json()}
+        if r.status_code == 404:
+            return {"status":"not_found", "order_ids":order_ids}
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 5)))
+            continue
+        if r.status_code &gt;= 500:
+            if server_retries &gt;= 1:
+                return {"status":"server_error", "order_ids":order_ids}
+            server_retries += 1
+            time.sleep(1)
+            continue
+        if r.status_code == 400:
+            raise RuntimeError(f"client batch bug: {r.text}")
+        r.raise_for_status()</code></pre>
+<p>Không <code>collect()</code> toàn bộ orders vào driver. Bounded batches, giới hạn concurrency và ghi request/error audit.</p>
+
+<h2>16. Step 14 — Silver business rules</h2>
+<table>
+<tr><th>Source issue</th><th>Xử lý</th><th>Gold impact</th></tr>
+<tr><td>phone null</td><td>Nullable, không fail</td><td>Hash/mask; không raw PII</td></tr>
+<tr><td>shipping_fee=0 không freeship</td><td>Flag anomaly, continue</td><td>Giữ revenue</td></tr>
+<tr><td>discount &gt; subtotal</td><td>Quarantine/flag</td><td>Loại khỏi revenue; không đổi thành free order</td></tr>
+<tr><td>quantity=0</td><td>Quarantine hoặc loại khỏi unit metrics</td><td>Không tính units sold</td></tr>
+<tr><td>cost_price &gt; base_price</td><td>Load bình thường</td><td><code>is_loss_making=true</code></td></tr>
+</table>
+<pre><code>direct_net_revenue =
+  SUM(orders.total_amount WHERE orders.status &lt;&gt; 'cancelled'
+                            AND payment_status IN ('paid','refunded')
+                            AND discount_amount &lt;= subtotal)
+  - SUM(refund_amount WHERE returns.status = 'refunded')
+
+marketplace_net_revenue =
+  SUM(floor(sale_price * quantity_sold * (1 - commission_rate))
+      WHERE status = 'completed')
+
+status IN ('returned','disputed'):
+  không recognized revenue; ghi riêng returned/disputed amount.
+
+earned_date = order_date
+cash_date = settlement_date  # T+15</code></pre>
+
+<h3>Required output matrix</h3>
+<table>
+<tr><th>Domain</th><th>Gold output tối thiểu</th><th>Required metrics</th></tr>
+<tr><td>Finance</td><td>fact_daily_revenue, fact_customer_spend, fact_voucher_effectiveness</td><td>Direct/marketplace revenue; commission; spend daily/monthly; discount/voucher; refund; top customers</td></tr>
+<tr><td>Operations</td><td>fact_daily_delivery, fact_return_rate</td><td>Success/failure; delivery time; redelivery; failure reason; return by category/channel</td></tr>
+<tr><td>Customer/Marketing</td><td>dim_customer_scd2, fact_customer_lifecycle, fact_product_rating</td><td>Tier vs spend; tier history; campaign; first/repeat/inactive; ratings</td></tr>
+<tr><td>Inventory/Product</td><td>fact_inventory_daily, fact_product_performance</td><td>EOD stock; best/slow sellers; loss; channel comparison; sell-through; stockout</td></tr>
+</table>
+<p>Channel contract: <code>channel_group = direct|marketplace</code>; <code>sales_channel = web|app|lazada|shopee|tiktok</code>. Mỗi Gold table phải ghi grain, key, measure, lineage và refresh rule.</p>
+
+<h2>17. Step 15 — Gold Finance vertical slice</h2>
+<p>Grain: <code>one row per business_date + channel + partner</code>.</p>
+<pre><code>CREATE TABLE IF NOT EXISTS polaris.gold.fact_daily_revenue (
+  business_date DATE, channel STRING, partner STRING,
+  gross_revenue DECIMAL(18,2),
+  discount_amount DECIMAL(18,2),
+  refunded_amount DECIMAL(18,2),
+  net_revenue DECIMAL(18,2),
+  source_reconciliation_status STRING,
+  run_id STRING, _ingested_at TIMESTAMP
+) USING iceberg
+PARTITIONED BY (days(business_date))
+TBLPROPERTIES ('format-version'='2');</code></pre>
+<p>Tách direct revenue và marketplace revenue trước, sau đó combine ở Gold. Lưu cả <code>order_date</code> và <code>settlement_date</code>; không dùng một date cho cả earned revenue và cash received.</p>
+
+<h2>18. Step 16 — Iceberg MERGE và idempotency</h2>
+<pre><code>MERGE INTO polaris.silver.marketplace_sales AS target
+USING polaris.work.marketplace_sales_stage AS source
+ON target.partner = source.partner
+AND target.external_order_id = source.external_order_id
+AND target.shopvn_product_id = source.shopvn_product_id
+AND target.order_date = source.order_date
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;</code></pre>
+<p>Workflow Silver: extract → <code>work</code> staging theo run_id → source/schema DQ → MERGE Silver → audit. Không đánh dấu source processed trước khi commit thành công.</p>
+<p>Workflow Gold bắt buộc: Silver → build <code>work.gold_*_candidate</code> → blocking DQ + Trino reconciliation → chỉ khi PASS mới MERGE Gold → audit SUCCESS → cleanup candidate. Candidate không thuộc Gold và không cấp quyền analytics.</p>
+<p>Test một business date ba lần:</p>
+<pre><code>Run 1: capture count/sum/duplicate count
+Run 2: capture count/sum/duplicate count
+Run 3: capture count/sum/duplicate count
+PASS: count_1 = count_2 = count_3
+      sum_1 = sum_2 = sum_3
+      duplicate business keys = 0</code></pre>
+
+<h2>19. Step 17 — SCD2 và inventory</h2>
+<p>Loyalty tier chỉ có lịch sử từ ngày go-live. Fields:</p>
+<pre><code>customer_id, loyalty_tier, effective_from, effective_to,
+is_current, attribute_hash, _run_id</code></pre>
+<p>Inventory: reconstruct từ <code>inventory_transactions</code>, không lấy bảng current inventory làm historical fact.</p>
+<pre><code>closing_stock = opening_stock + inbound - outbound + adjustment
+avg_daily_units_sold = units_sold_last_7_days / 7
+days_to_stockout = NULL nếu avg_daily_units_sold &lt;= 0,
+                   ngược lại current_stock / avg_daily_units_sold</code></pre>
+
+<h2>20. Step 18 — DQ gates</h2>
+<p>Blocking trước Gold: null required key, duplicate key, row-count reconciliation, amount reconciliation, checksum mismatch, inventory equation, unexpected empty candidate, breaking type change.</p>
+<p>Warning: nullable phone, shipping anomaly, known missing SFTP file, expected API 404/no shipment, loss-making product.</p>
+<pre><code>DQ result:
+check_name, dataset, business_date, severity, actual_value,
+expected_value, status, failed_records, run_id, checked_at</code></pre>
+<p>Blocking DQ phải ghi kết quả vào <code>audit.dq_results</code> rồi fail task. Gold không được insert/MERGE khi bất kỳ blocking check nào FAIL. Sau commit chỉ chạy read-only observability checks (freshness, snapshot id, published row count); đây không phải DQ gate và không thay đổi dữ liệu.</p>
+
+<h3>Pre-Gold publish contract</h3>
+<pre><code>1. Candidate table key includes run_id + business_date.
+2. Candidate count &gt; 0 when source data exists.
+3. Candidate business keys unique and required keys non-null.
+4. Candidate amount reconciles with Silver/source within 0.01 VND tolerance rule.
+5. Candidate covers expected partners/channels or has approved warning manifest.
+6. All blocking results = PASS.
+7. Spark MERGE candidate into Gold using deterministic key.
+8. Record published Iceberg snapshot_id in audit.pipeline_runs.</code></pre>
+
+<h2>21. Step 19 — Schema evolution, snapshots, time travel</h2>
+<table>
+<tr><th>Change</th><th>Policy</th></tr>
+<tr><td>New nullable column</td><td>Cho phép vào Bronze, warning; Silver cần xác định semantics</td></tr>
+<tr><td>Missing required column</td><td>Fail</td></tr>
+<tr><td>Compatible numeric widening</td><td>Explicit cast, audit</td></tr>
+<tr><td>Breaking type change</td><td>Fail, không silent cast</td></tr>
+<tr><td>New SFTP partner</td><td>Config-driven</td></tr>
+</table>
+<pre><code>SELECT * FROM polaris.gold.fact_daily_revenue.history;
+SELECT * FROM polaris.gold.fact_daily_revenue.snapshots;
+SELECT *
+FROM polaris.gold.fact_daily_revenue
+FOR SYSTEM_VERSION AS OF &lt;snapshot_id&gt;;</code></pre>
+<p>Không expire snapshots trước khi lưu evidence time travel.</p>
+
+<h2>22. Step 20 — Airflow DAG</h2>
+<pre><code>from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.providers.common.sql.operators.sql import SQLCheckOperator
+
+with DAG(
+  dag_id="shopvn_daily_iceberg_lakehouse",
+  start_date=datetime(2026, 6, 1),
+  schedule="0 1 * * *",
+  catchup=False,
+  max_active_runs=1,
+  max_active_tasks=2,
+  default_args={"owner":"shopvn", "retries":2,
+                "retry_delay":timedelta(minutes=5)},
+  dagrun_timeout=timedelta(hours=5)
+) as dag:
+  pg = BashOperator(task_id="postgres_to_bronze",
+        pool="spark_pool",
+        bash_command="spark-submit /opt/shopvn/spark/jobs/ingestion/postgres.py")
+  sftp = BashOperator(task_id="sftp_to_bronze",
+        bash_command="python /opt/shopvn/spark/jobs/ingestion/sftp.py")
+  silver = BashOperator(task_id="build_finance_silver",
+        pool="spark_pool",
+        bash_command="spark-submit /opt/shopvn/spark/jobs/silver/build_finance.py")
+  candidate = BashOperator(task_id="build_gold_candidate",
+        pool="spark_pool",
+        bash_command="spark-submit /opt/shopvn/spark/jobs/gold/build_candidate.py --start-date {{ data_interval_start | ds }} --end-date {{ data_interval_end | ds }} --run-id '{{ run_id }}'")
+  pre_gold_dq = BashOperator(task_id="pre_gold_dq",
+        bash_command="python /opt/shopvn/spark/jobs/quality/run_pre_gold_dq.py --run-id '{{ run_id }}'")
+  reconcile = SQLCheckOperator(task_id="trino_candidate_reconciliation",
+        conn_id="trino_shopvn",
+        sql="/opt/shopvn/sql/reconciliation/candidate_check.sql",
+        params={"run_id":"{{ run_id }}"})
+  publish = BashOperator(task_id="publish_gold",
+        pool="spark_pool",
+        bash_command="spark-submit /opt/shopvn/spark/jobs/gold/publish.py --run-id '{{ run_id }}'")
+  [pg, sftp] &gt;&gt; silver &gt;&gt; candidate &gt;&gt; pre_gold_dq &gt;&gt; reconcile &gt;&gt; publish</code></pre>
+<p>Tạo Airflow pool <code>spark_pool</code> với đúng một slot để không có hai JVM Spark cùng chạy. Mọi job nhận <code>start_date/end_date/run_id</code>; không dùng <code>datetime.now()</code> để chọn dữ liệu. <code>catchup=False</code>: không tự động backfill toàn lịch sử khi deploy; backfill manual theo date range. Thêm failure callback và SLA/deadline alert nếu pipeline có nguy cơ không hoàn thành trước 08:00 Asia/Ho_Chi_Minh.</p>
+<p>Snippet trên là Finance vertical slice. Khi mở rộng, dùng TaskGroup/branch theo dependency: Finance = PostgreSQL+SFTP; Operations = PostgreSQL+API; Customer = PostgreSQL; Inventory = PostgreSQL+SFTP. Không bắt Finance chờ API và không dùng một task <code>build_all_silver</code> khổng lồ.</p>
+
+<h2>23. Step 21 — Trino reconciliation</h2>
+<pre><code>WITH source_revenue AS (
+  SELECT business_date, SUM(net_revenue) AS source_net
+  FROM shopvn.silver.revenue_components
+  GROUP BY business_date
+), candidate_revenue AS (
+  SELECT business_date, SUM(net_revenue) AS candidate_net
+  FROM shopvn.work.gold_revenue_candidate
+  WHERE run_id = '{{ params.run_id }}'
+  GROUP BY business_date
+), violations AS (
+  SELECT s.business_date, s.source_net, c.candidate_net,
+         c.candidate_net - s.source_net AS difference
+  FROM source_revenue s
+  FULL OUTER JOIN candidate_revenue c USING (business_date)
+  WHERE s.business_date IS NULL OR c.business_date IS NULL
+     OR ABS(COALESCE(c.candidate_net,0) - COALESCE(s.source_net,0)) &gt; 0.01
+)
+SELECT COUNT(*) = 0 AS check_passed FROM violations;</code></pre>
+<p><code>SQLCheckOperator</code> chỉ PASS khi query trả <code>true</code>. Công thức source phải phản ánh refund, payment/status và invalid-discount rules. Trino là READ_ONLY nên không thể tự publish Gold.</p>
+
+<h2>24. Step 22 — Security, monitoring, CI/CD</h2>
+<pre><code># PII masking trước analytics
+analytics_customers = (
+  customers
+  .withColumn("email_hash", F.sha2(F.col("email"), 256))
+  .withColumn("customer_name_hash", F.sha2(F.col("full_name"), 256))
+  .withColumn("masked_phone",
+      F.concat(F.substring("phone",1,3), F.lit("****"),
+               F.substring("phone",-2,2)))
+  .drop("email", "phone", "full_name", "district", "ward")
+)</code></pre>
+<p>Bronze chứa PII phải được coi là restricted; Trino analytics principal chỉ được READ trên Gold. Secrets dùng <code>.env</code>/Airflow Connections và Trino environment substitution; không commit source credentials, MinIO root keys hoặc Polaris client secret.</p>
+<h3>Monitoring tối thiểu, không over-engineer</h3>
+<p>Thêm StatsD exporter + Prometheus + Grafana với tổng limit 640 MB. Chỉ cần một dashboard ShopVN gồm: pipeline finish time, SLA status, task failures, component health, source/Bronze row counts, DQ status, API retries, SFTP manifest status, candidate reconciliation difference và Gold freshness.</p>
+<pre><code>Alerts bắt buộc:
+1. Pipeline chưa publish Gold trước 07:30 hoặc miss 08:00 SLA.
+2. Blocking pre-Gold DQ/reconciliation FAIL.
+3. SFTP CORRUPT hoặc required source unavailable.
+4. Polaris/MinIO/Trino/Airflow scheduler health DOWN.</code></pre>
+<h3>CI/CD gates</h3>
+<pre><code>pytest tests/
+ruff check .
+bandit -r spark dags
+docker compose config</code></pre>
+<pre><code>CI order:
+1. lint + secret scan
+2. unit tests for business rules/retry/checksum/SCD2
+3. DAG import/dependency test
+4. Spark local transformation tests on small fixtures
+5. Compose config validation
+6. optional integration profile: MinIO + Polaris + Spark + Trino smoke test
+7. package/image build; deployment remains manual for homework</code></pre>
+<p>Runbooks tối thiểu: API timeout/429, SFTP missing, SFTP corrupt, revenue reconciliation failure, breaking schema.</p>
+
+<h3>Iceberg maintenance sau khi functional requirements PASS</h3>
+<p>Không optimize sớm. Sau khi idempotency/evidence ổn định, chạy compaction có filter theo partition bị ảnh hưởng và expire snapshots với retention đủ dài để giữ demo time travel. Ghi số data files trước/sau; không chạy full-table maintenance mỗi DAG.</p>
+
+<h2>25. Risk register và non-goals</h2>
+<table>
+<tr><th>Risk</th><th>Mitigation vừa đủ</th></tr>
+<tr><td>8 GB RAM / OOM</td><td>Hard limits, LocalExecutor, Spark local[2], one active Spark task, monitoring profile nhẹ</td></tr>
+<tr><td>Polaris/MinIO credential mismatch</td><td>Official 1.7 bootstrap, vended credentials, compatibility gate trước ingestion</td></tr>
+<tr><td>Catalog mất sau restart</td><td>Polaris JDBC persistence và restart test</td></tr>
+<tr><td>Gold bị publish dữ liệu lỗi</td><td>work candidate + blocking DQ/Trino reconciliation trước MERGE Gold</td></tr>
+<tr><td>Mutable orders không có updated_at</td><td>30-day sliding re-extract + key MERGE; explicit backfill</td></tr>
+<tr><td>Small files/snapshot growth</td><td>One writer, bounded partitions, maintenance sau functional pass</td></tr>
+<tr><td>Multi-table publish không atomic toàn DAG</td><td>Gold tables có published run_id; audit chỉ đánh dấu domain/date SUCCESS khi tất cả target commits thành công; analytics lọc published dates</td></tr>
+</table>
+<p><strong>Non-goals:</strong> Kubernetes, Spark cluster nhiều worker, Kafka/streaming, dbt, enterprise IAM/Keycloak, multi-region MinIO và custom lineage platform. Những phần này không cần để đạt rubric và sẽ làm bài quá tải.</p>
+
+<h2>26. Evidence checklist</h2>
+<table>
+<tr><th>Tiêu chí</th><th>Evidence</th></tr>
+<tr><td>End-to-end 20%</td><td>Airflow run, source counts, Gold query</td></tr>
+<tr><td>Idempotency/reconciliation 20%</td><td>Ba run cùng date, counts/sums/duplicates</td></tr>
+<tr><td>Failure handling 20%</td><td>API retry/error logs, SFTP manifest, quarantine</td></tr>
+<tr><td>Schema evolution 10%</td><td>New-column pass và type-mismatch fail</td></tr>
+<tr><td>Monitoring 15%</td><td>Dashboard/logs: finish, stability, revenue match</td></tr>
+<tr><td>Security 10%</td><td>Secret scan, Gold không raw PII</td></tr>
+<tr><td>Runbook 5%</td><td>Ít nhất ba incident có safe rerun</td></tr>
+</table>
+<h2>27. Deliverables và Definition of Done</h2>
+<p>Repository cuối phải có: working pipeline; architecture diagram; data model/ERD với grain; Airflow DAG; automated DQ suite; Grafana dashboard; CI config; ít nhất ba runbooks; demo presentation; design-decisions document.</p>
+<ul>
+<li class="check">Source Compose và pipeline Compose chạy độc lập, cùng network đúng.</li>
+<li class="check">Spark tạo/ghi/đọc Iceberg qua Polaris; Trino đọc cùng table.</li>
+<li class="check">MinIO bucket và Iceberg snapshots tồn tại.</li>
+<li class="check">Finance vertical slice chạy PostgreSQL + SFTP end-to-end.</li>
+<li class="check">Sau đó bao phủ Operations, Customer/Marketing, Inventory/Product.</li>
+<li class="check">API failures, SFTP failures, DQ issues được xử lý đúng.</li>
+<li class="check">Blocking DQ/reconciliation chạy trên work candidate trước Gold; FAIL không tạo Gold snapshot mới.</li>
+<li class="check">Rerun ba lần không duplicate và amount không đổi.</li>
+<li class="check">Schema evolution, SCD2, inventory snapshot, time travel có test.</li>
+<li class="check">Airflow retry/SLA/dependency/backfill, Trino reconciliation, monitoring, CI/CD và runbook hoàn chỉnh.</li>
+<li class="check">Tổng resource limit không vượt 8 GB.</li>
+</ul>
+<div class="note"><strong>Thứ tự thực tế:</strong> hoàn tất Gate 7 trước; sau đó PostgreSQL Bronze → SFTP Bronze → Finance Silver → work candidate → pre-Gold DQ/Trino reconciliation → Gold publish → idempotency/time travel → API/Operations → Customer → Inventory → monitoring/CI/runbook.</div>
+<h2>28. Nguồn tham khảo</h2>
+<ul>
+<li><a href="https://polaris.apache.org/guides/minio/">Apache Polaris + MinIO</a></li>
+<li><a href="https://polaris.apache.org/guides/jdbc/">Apache Polaris JDBC persistence</a></li>
+<li><a href="https://polaris.apache.org/downloads/1.7.0/">Apache Polaris 1.7.0 release</a></li>
+<li><a href="https://iceberg.apache.org/docs/latest/spark-configuration/">Apache Iceberg Spark configuration</a></li>
+<li><a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a></li>
+<li><a href="https://trino.io/docs/current/object-storage/metastores.html">Trino REST catalog</a></li>
+<li><a href="https://hub.docker.com/r/minio/minio/tags">MinIO Docker tags</a></li>
+</ul>
+</main>
+</body>
+</html>

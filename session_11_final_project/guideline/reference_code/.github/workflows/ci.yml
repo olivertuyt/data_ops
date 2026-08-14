@@ -1,0 +1,25 @@
+name: shopvn-reference-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: pip install pyspark==3.5.6 requests==2.32.3 paramiko==3.5.1 pytest==8.4.1
+      - name: Compile Python
+        run: python -m compileall -q common jobs dags monitoring tests
+      - name: Run unit tests
+        run: pytest -q tests
+      - name: Validate Docker Compose
+        env:
+          SHOPVN_ENV_FILE: .env.example
+        run: docker compose --env-file .env.example config --quiet

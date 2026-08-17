@@ -1,0 +1,2 @@
+# Compatibility shim for the original filename. Prefer requirements.txt.
+-r requirements.txt

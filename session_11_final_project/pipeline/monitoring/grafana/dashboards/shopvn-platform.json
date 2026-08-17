@@ -1,0 +1,26 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "title": "Component health",
+      "type": "stat",
+      "targets": [{"expr": "probe_success", "legendFormat": "{{instance}}", "refId": "A"}],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "title": "Airflow metrics",
+      "type": "timeseries",
+      "targets": [{"expr": "airflow_metric", "legendFormat": "{{airflow_metric}}", "refId": "A"}],
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 8}
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["shopvn", "dataops"],
+  "templating": {"list": []},
+  "time": {"from": "now-24h", "to": "now"},
+  "title": "ShopVN Platform Health",
+  "uid": "shopvn-platform-health",
+  "version": 1
+}
+

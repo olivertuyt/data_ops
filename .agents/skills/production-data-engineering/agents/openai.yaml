@@ -1,0 +1,4 @@
+interface:
+  display_name: "Production Data Engineering"
+  short_description: "Build and operate reliable, test-gated data pipelines"
+  default_prompt: "Use $production-data-engineering to design, implement, review, or verify this data pipeline task."

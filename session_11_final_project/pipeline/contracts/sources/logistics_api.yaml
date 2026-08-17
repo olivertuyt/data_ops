@@ -1,0 +1,50 @@
+contract_version: 1
+dataset: logistics_shipments
+owner: operations
+technical_owner: data-platform
+source_of_truth: ShopVN Logistics API fixture
+purpose: Carrier, tracking, delivery duration, attempts, and failure analysis.
+connection: LOGISTICS_API_URL and LOGISTICS_API_KEY environment variables
+timezone: ISO-8601 source offsets normalized to Asia/Ho_Chi_Minh in Spark
+freshness: daily before 08:00 local time
+grain: one row per order_id when a shipment exists
+key: [order_id]
+join: LEFT JOIN PostgreSQL orders on order_id; approximately 8 percent legitimately absent
+request_contract:
+  method: GET
+  path: /v1/shipments
+  parameter: comma-separated order_ids
+  batch_size: 1..50
+  rate_limit: 100 requests per minute; client targets 95
+response_contract:
+  required: [shipments, count]
+  optional: [not_found, not_found_count]
+  all_found_behavior: not_found fields may be omitted and are interpreted as empty
+  reconciliation: count equals shipments length; when present, not_found_count equals not_found length
+failure_policy:
+  404: audit and do not retry
+  429: respect retry_after with a bounded maximum of 8 retries
+  timeout: retry after 1, 2, and 4 seconds, then block Operations
+  500: retry once, then block Operations
+  400_401: fail fast as client/authentication errors
+schema:
+  order_id: {type: string, nullable: false}
+  carrier: {type: string, nullable: false, allowed: [ghn, ghtk]}
+  tracking_code: {type: string, nullable: true}
+  status: {type: string, nullable: false, allowed: [picked_up, in_transit, delivered, failed, returned]}
+  actual_shipping_fee: {type: integer, nullable: true, unit: VND}
+  shipped_at: {type: timestamp, nullable: true}
+  actual_delivery_date: {type: timestamp, nullable: true}
+  estimated_delivery_date: {type: date, nullable: true}
+  recipient_province: {type: string, nullable: true, pii: quasi}
+  recipient_district: {type: string, nullable: true, pii: quasi}
+  delivery_attempts: {type: integer, nullable: true}
+  failure_reason: {type: string, nullable: true}
+schema_evolution:
+  additive_nullable: retained in raw payload; explicit Silver adoption requires review
+  missing_or_incompatible_required: block Operations publication
+retention: raw payload and API events 365 days
+delete_semantics: absent shipment is not a delete; later successful lookup upserts by order_id
+dq:
+  blocking: [invalid_response_shape, null_order_id, duplicate_order_id, delivery_before_ship]
+  warning: [expected_not_found]

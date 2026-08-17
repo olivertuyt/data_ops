@@ -1,0 +1,137 @@
+contract_version: 1
+dataset_family: shopvn_postgresql
+owner: data-platform
+stewards: [finance, operations, marketing, product]
+purpose: System of record for direct commerce, customers, products, and inventory.
+source_of_truth: ShopVN PostgreSQL fixture
+connection: environment variables SHOPVN_DB_HOST, SHOPVN_DB_PORT, SHOPVN_DB_NAME
+access: read-only SELECT
+timezone: Asia/Ho_Chi_Minh
+freshness: daily before 08:00 local time
+ingestion: full snapshot plus primary-key MERGE for the bounded 30-day project fixture
+replay_window: explicit bounded start_date/end_date; source snapshot is re-readable
+delete_semantics: physical deletes unsupported; is_active is honored where supplied
+retention: Bronze 365 days; audit and manifests 730 days
+schema_evolution:
+  additive_nullable: add to Bronze and audit
+  breaking: fail before write for remove, rename, incompatible type, unit, or semantic change
+privacy:
+  classification: restricted
+  pii_fields: [customers.full_name, customers.phone, customers.email, product_reviews.comment]
+  analytics_policy: salted hashes for direct identifiers; free-text comments excluded from Silver
+dq:
+  blocking: [null_primary_key, duplicate_primary_key, incompatible_schema, failed_cast]
+  warning: [nullable_phone, zero_shipping_fee, discount_gt_subtotal, zero_quantity, cost_gt_base]
+tables:
+  customers:
+    grain: one row per customer
+    key: [customer_id]
+    schema:
+      customer_id: {type: integer, nullable: false}
+      full_name: {type: varchar, nullable: false, pii: direct}
+      phone: {type: varchar, nullable: true, pii: direct}
+      email: {type: varchar, nullable: false, pii: direct}
+      city: {type: varchar, nullable: true}
+      district: {type: varchar, nullable: true, pii: quasi}
+      ward: {type: varchar, nullable: true, pii: quasi}
+      gender: {type: varchar, nullable: true, allowed: [male, female, other]}
+      date_of_birth: {type: date, nullable: true, pii: sensitive}
+      loyalty_tier: {type: varchar, nullable: false, allowed: [bronze, silver, gold, platinum]}
+      created_at: {type: timestamp, nullable: false}
+  products:
+    grain: one row per product
+    key: [product_id]
+    schema:
+      product_id: {type: integer, nullable: false}
+      name: {type: varchar, nullable: false}
+      category: {type: varchar, nullable: false}
+      subcategory: {type: varchar, nullable: true}
+      brand: {type: varchar, nullable: true}
+      sku: {type: varchar, nullable: false, unique: true}
+      base_price: {type: decimal, nullable: false, unit: VND}
+      cost_price: {type: decimal, nullable: false, unit: VND}
+      weight_gram: {type: integer, nullable: true, unit: gram}
+      is_active: {type: boolean, nullable: false}
+      created_at: {type: timestamp, nullable: false}
+  orders:
+    grain: one row per direct-channel order
+    key: [order_id]
+    schema:
+      order_id: {type: varchar, nullable: false}
+      customer_id: {type: integer, nullable: false}
+      voucher_code: {type: varchar, nullable: true}
+      channel: {type: varchar, nullable: false, allowed: [web, app]}
+      order_date: {type: date, nullable: false}
+      status: {type: varchar, nullable: false, allowed: [delivered, shipping, confirmed, cancelled, returned]}
+      subtotal: {type: decimal, nullable: false, unit: VND}
+      shipping_fee: {type: decimal, nullable: false, unit: VND}
+      discount_amount: {type: decimal, nullable: false, unit: VND}
+      total_amount: {type: decimal, nullable: false, unit: VND}
+      payment_method: {type: varchar, nullable: false}
+      payment_status: {type: varchar, nullable: false, allowed: [pending, paid, failed, refunded]}
+      created_at: {type: timestamp, nullable: false}
+  order_items:
+    grain: one row per source order line
+    key: [item_id]
+    schema:
+      item_id: {type: integer, nullable: false}
+      order_id: {type: varchar, nullable: false}
+      product_id: {type: integer, nullable: false}
+      quantity: {type: integer, nullable: false}
+      unit_price: {type: decimal, nullable: false, unit: VND}
+      discount_per_item: {type: decimal, nullable: false, unit: VND}
+      total_price: {type: decimal, nullable: false, unit: VND}
+  vouchers:
+    grain: one row per voucher code
+    key: [voucher_code]
+    schema:
+      voucher_code: {type: varchar, nullable: false}
+      type: {type: varchar, nullable: false, allowed: [value, percent]}
+      value: {type: decimal, nullable: false}
+      min_order_value: {type: decimal, nullable: true, unit: VND}
+      max_discount: {type: decimal, nullable: true, unit: VND}
+      campaign_id: {type: varchar, nullable: true}
+      valid_from: {type: date, nullable: false}
+      valid_to: {type: date, nullable: false}
+      usage_count: {type: integer, nullable: false}
+      max_usage: {type: integer, nullable: false}
+  inventory:
+    grain: one current row per product
+    key: [product_id]
+    schema:
+      product_id: {type: integer, nullable: false}
+      warehouse_id: {type: varchar, nullable: false}
+      stock_qty: {type: integer, nullable: false, unit: units}
+      last_updated: {type: timestamp, nullable: false}
+  inventory_transactions:
+    grain: one row per stock movement
+    key: [txn_id]
+    schema:
+      txn_id: {type: integer, nullable: false}
+      product_id: {type: integer, nullable: false}
+      order_id: {type: varchar, nullable: true}
+      type: {type: varchar, nullable: false, allowed: [reserve, release, sold, restock]}
+      qty_change: {type: integer, nullable: false, unit: units}
+      created_at: {type: timestamp, nullable: false}
+  returns:
+    grain: one row per return request
+    key: [return_id]
+    schema:
+      return_id: {type: integer, nullable: false}
+      order_id: {type: varchar, nullable: false}
+      reason: {type: varchar, nullable: true}
+      status: {type: varchar, nullable: false, allowed: [pending, approved, rejected, refunded]}
+      refund_amount: {type: decimal, nullable: false, unit: VND}
+      created_at: {type: timestamp, nullable: false}
+  product_reviews:
+    grain: one row per review
+    key: [review_id]
+    schema:
+      review_id: {type: integer, nullable: false}
+      order_id: {type: varchar, nullable: false}
+      product_id: {type: integer, nullable: false}
+      customer_id: {type: integer, nullable: false}
+      rating: {type: integer, nullable: false, range: [1, 5]}
+      comment: {type: text, nullable: true, pii: unstructured}
+      created_at: {type: timestamp, nullable: false}
+

@@ -1,6 +1,9 @@
 services:
   postgres:
     image: anhnguyen1611/masterclass-dataops-postgres:v1.1.0
+    # The course images are published for ARM64 only; Docker Desktop emulates them on
+    # AMD64 developer machines.
+    platform: linux/arm64
     container_name: masterclass-dataops-postgres
     ports:
       - "5434:5432"
@@ -19,6 +22,7 @@ services:
 
   api:
     image: anhnguyen1611/masterclass-dataops-api:v1.1.0
+    platform: linux/arm64
     container_name: masterclass-dataops-api
     ports:
       - "8000:8000"
@@ -42,6 +46,7 @@ services:
 
   sftp:
     image: anhnguyen1611/masterclass-dataops-sftp:v1.1.0
+    platform: linux/arm64
     container_name: masterclass-dataops-sftp
     ports:
       - "2222:22"

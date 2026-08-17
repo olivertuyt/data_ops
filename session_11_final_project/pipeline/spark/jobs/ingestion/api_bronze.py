@@ -1,488 +1,377 @@
+"""Ingest logistics shipments with bounded batches and explicit retry rules."""
+
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import os
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import requests
+from common.audit import write_run_audit
+from common.config import ApiSourceConfig, validate_date_range, validate_run_id
+from common.iceberg import assert_unique_non_null, merge_upsert
+from common.spark_session import create_spark_session
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    IntegerType,
-    LongType,
-    StringType,
-    StructField,
-    StructType,
-    TimestampType,
-)
+from pyspark.sql import types as T
 
-from common.iceberg_utils import (
-    build_spark,
-    create_namespace_if_needed,
-    create_table_if_needed,
-    merge_into_iceberg,
-)
-
-
-SHIPMENT_SCHEMA = StructType(
+BATCH_SIZE = 50
+MAX_RATE_LIMIT_RETRIES = 8
+SHIPMENT_SCHEMA = T.StructType(
     [
-        StructField("order_id", StringType(), True),
-        StructField("carrier", StringType(), True),
-        StructField("tracking_code", StringType(), True),
-        StructField("status", StringType(), True),
-        StructField(
-            "actual_shipping_fee",
-            LongType(),
-            True,
-        ),
-        StructField("shipped_at", StringType(), True),
-        StructField(
-            "actual_delivery_date",
-            StringType(),
-            True,
-        ),
-        StructField(
-            "estimated_delivery_date",
-            StringType(),
-            True,
-        ),
-        StructField(
-            "recipient_province",
-            StringType(),
-            True,
-        ),
-        StructField(
-            "recipient_district",
-            StringType(),
-            True,
-        ),
-        StructField(
-            "delivery_attempts",
-            IntegerType(),
-            True,
-        ),
-        StructField(
-            "failure_reason",
-            StringType(),
-            True,
-        ),
-        StructField(
-            "_raw_payload",
-            StringType(),
-            True,
-        ),
+        T.StructField("order_id", T.StringType(), True),
+        T.StructField("carrier", T.StringType(), True),
+        T.StructField("tracking_code", T.StringType(), True),
+        T.StructField("status", T.StringType(), True),
+        T.StructField("actual_shipping_fee", T.LongType(), True),
+        T.StructField("shipped_at", T.StringType(), True),
+        T.StructField("actual_delivery_date", T.StringType(), True),
+        T.StructField("estimated_delivery_date", T.StringType(), True),
+        T.StructField("recipient_province", T.StringType(), True),
+        T.StructField("recipient_district", T.StringType(), True),
+        T.StructField("delivery_attempts", T.IntegerType(), True),
+        T.StructField("failure_reason", T.StringType(), True),
+        T.StructField("_raw_payload", T.StringType(), False),
+        T.StructField("_source_batch_id", T.StringType(), False),
+        T.StructField("_source_row_hash", T.StringType(), False),
+        T.StructField("_source_system", T.StringType(), False),
+        T.StructField("_run_id", T.StringType(), False),
+        T.StructField("_ingested_at", T.TimestampType(), False),
+    ]
+)
+API_EVENT_SCHEMA = T.StructType(
+    [
+        T.StructField("run_id", T.StringType(), False),
+        T.StructField("start_date", T.StringType(), False),
+        T.StructField("end_date", T.StringType(), False),
+        T.StructField("event_type", T.StringType(), False),
+        T.StructField("order_ids", T.StringType(), False),
+        T.StructField("status_code", T.IntegerType(), True),
+        T.StructField("blocks_downstream", T.BooleanType(), False),
+        T.StructField("message", T.StringType(), False),
+        T.StructField("recorded_at", T.TimestampType(), False),
     ]
 )
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+@dataclass
+class ApiEvent:
+    run_id: str
+    start_date: str
+    end_date: str
+    event_type: str
+    order_ids: str
+    status_code: int | None
+    blocks_downstream: bool
+    message: str
+    recorded_at: datetime
 
+
+class RequestRateLimiter:
+    def __init__(self, requests_per_minute: int) -> None:
+        if requests_per_minute <= 0:
+            raise ValueError("requests_per_minute must be positive")
+        self.minimum_interval_seconds = 60.0 / requests_per_minute
+        self.last_request_at = 0.0
+
+    def wait(self) -> None:
+        elapsed = time.monotonic() - self.last_request_at
+        if elapsed < self.minimum_interval_seconds:
+            time.sleep(self.minimum_interval_seconds - elapsed)
+        self.last_request_at = time.monotonic()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=50,
-    )
-
+    parser.add_argument("--landing-dir", required=True)
     return parser.parse_args()
 
 
-def read_order_ids(spark, args):
-    host = os.getenv("SHOPVN_DB_HOST", "postgres")
-    port = os.getenv("SHOPVN_DB_PORT", "5432")
-    database = os.getenv("SHOPVN_DB_NAME", "shopvn")
-    user = os.getenv("SHOPVN_DB_USER", "shopvn_reader")
-    password = os.getenv("SHOPVN_DB_PASSWORD", "readonly123")
-
-    jdbc_url = (
-        f"jdbc:postgresql://{host}:{port}/{database}"
-    )
-
-    query = f"""
-    (
-        SELECT order_id
-        FROM orders
-        WHERE order_date BETWEEN
-            DATE '{args.start_date}'
-            AND DATE '{args.end_date}'
-        ORDER BY order_id
-    ) AS order_ids
-    """
-
-    return (
-        spark.read.format("jdbc")
-        .option("url", jdbc_url)
-        .option("dbtable", query)
-        .option("user", user)
-        .option("password", password)
-        .option("driver", "org.postgresql.Driver")
-        .option("fetchsize", "10000")
-        .load()
-    )
-
-
-def chunk_values(values, batch_size):
-    for index in range(0, len(values), batch_size):
-        yield values[index:index + batch_size]
-
-
-def retry_after_seconds(response):
-    try:
-        payload = response.json()
-
-        if payload.get("retry_after") is not None:
-            return float(payload["retry_after"])
-    except Exception:
-        pass
-
-    header_value = response.headers.get("Retry-After")
-
-    if header_value:
+def retry_after_seconds(response: requests.Response) -> float:
+    header = response.headers.get("Retry-After")
+    if header:
         try:
-            return float(header_value)
+            return max(0.0, float(header))
         except ValueError:
             pass
+    try:
+        return max(0.0, float(response.json().get("retry_after", 5)))
+    except (ValueError, TypeError, requests.JSONDecodeError):
+        return 5.0
 
-    return 5.0
+
+def validate_success_payload(payload: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("API contract failure: response must be an object")
+    shipments = payload.get("shipments")
+    # The fixture omits not_found/not_found_count when every requested order exists.
+    not_found = payload.get("not_found", [])
+    if not isinstance(shipments, list) or not isinstance(not_found, list):
+        raise RuntimeError("API contract failure: shipments and not_found must be arrays")
+    if any(not isinstance(item, dict) or not item.get("order_id") for item in shipments):
+        raise RuntimeError("API contract failure: every shipment requires order_id")
+    count = payload.get("count")
+    if count is not None and (not isinstance(count, int) or count != len(shipments)):
+        raise RuntimeError("API contract failure: count must equal the shipments length")
+    not_found_count = payload.get("not_found_count")
+    if not_found_count is not None and (
+        not isinstance(not_found_count, int) or not_found_count != len(not_found)
+    ):
+        raise RuntimeError("API contract failure: not_found_count must equal not_found length")
+    return shipments, [str(item) for item in not_found]
 
 
-def call_api(session, base_url, api_key, order_ids):
-    if not order_ids or len(order_ids) > 50:
-        raise ValueError(
-            "API batch size must be between 1 and 50"
-        )
-
-    url = (
-        f"{base_url.rstrip('/')}/v1/shipments"
+def technical_event(
+    event_type: str,
+    order_ids: list[str],
+    status_code: int | None,
+    message: str,
+) -> ApiEvent:
+    return ApiEvent(
+        run_id="",
+        start_date="",
+        end_date="",
+        event_type=event_type,
+        order_ids=",".join(order_ids),
+        status_code=status_code,
+        blocks_downstream=True,
+        message=message[:1000],
+        recorded_at=datetime.now(UTC).replace(tzinfo=None),
     )
 
-    headers = {
-        "X-API-Key": api_key,
-        "Accept": "application/json",
-    }
 
-    timeout_attempt = 0
-    server_attempt = 0
-
+def fetch_batch(
+    session: requests.Session,
+    limiter: RequestRateLimiter,
+    config: ApiSourceConfig,
+    order_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[str], ApiEvent | None]:
+    if not 1 <= len(order_ids) <= BATCH_SIZE:
+        raise ValueError(f"API batch size must be between 1 and {BATCH_SIZE}")
+    timeout_retries = 0
+    server_retries = 0
+    rate_limit_retries = 0
     while True:
+        limiter.wait()
         try:
             response = session.get(
-                url=url,
-                headers=headers,
-                params={
-                    "order_ids": ",".join(order_ids)
-                },
-                timeout=(5, 35),
+                f"{config.base_url}/v1/shipments",
+                headers={"X-API-Key": config.api_key},
+                params={"order_ids": ",".join(order_ids)},
+                timeout=(config.connect_timeout_seconds, config.read_timeout_seconds),
             )
-
-        except requests.Timeout as exc:
-            if timeout_attempt >= 3:
-                return {
-                    "shipments": [],
-                    "not_found": [],
-                    "errors": [
-                        {
-                            "error_type": "timeout_exhausted",
-                            "message": str(exc),
-                            "order_ids": order_ids,
-                        }
-                    ],
-                }
-
-            time.sleep(
-                [1, 2, 4][timeout_attempt]
-            )
-
-            timeout_attempt += 1
+        except requests.Timeout:
+            if timeout_retries >= 3:
+                return (
+                    [],
+                    [],
+                    technical_event(
+                        "timeout_exhausted", order_ids, None, "Timeout after 1s/2s/4s retries"
+                    ),
+                )
+            time.sleep((1, 2, 4)[timeout_retries])
+            timeout_retries += 1
             continue
 
         if response.status_code == 200:
-            payload = response.json()
-
-            shipments = payload.get(
-                "shipments",
-                [],
-            )
-
-            for shipment in shipments:
-                shipment["_raw_payload"] = json.dumps(
-                    shipment,
-                    ensure_ascii=False,
-                )
-
-            return {
-                "shipments": shipments,
-                "not_found": payload.get(
-                    "not_found",
-                    [],
-                ),
-                "errors": [],
-            }
-
-        if response.status_code == 401:
-            raise RuntimeError(
-                "API authentication failed"
-            )
-
-        if response.status_code == 400:
-            raise RuntimeError(
-                "API returned HTTP 400. "
-                "Check batch size."
-            )
-
+            shipments, not_found = validate_success_payload(response.json())
+            return shipments, not_found, None
         if response.status_code == 404:
-            return {
-                "shipments": [],
-                "not_found": order_ids,
-                "errors": [],
-            }
-
+            return [], order_ids, None
         if response.status_code == 429:
-            time.sleep(
-                retry_after_seconds(response)
-            )
-            continue
-
-        if response.status_code == 500:
-            if server_attempt >= 1:
-                return {
-                    "shipments": [],
-                    "not_found": [],
-                    "errors": [
-                        {
-                            "error_type": (
-                                "server_error_exhausted"
-                            ),
-                            "message": response.text[:1000],
-                            "order_ids": order_ids,
-                        }
-                    ],
-                }
-
-            server_attempt += 1
-            time.sleep(2)
-            continue
-
-        return {
-            "shipments": [],
-            "not_found": [],
-            "errors": [
-                {
-                    "error_type": (
-                        f"http_{response.status_code}"
+            if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
+                return (
+                    [],
+                    [],
+                    technical_event(
+                        "rate_limit_exhausted",
+                        order_ids,
+                        429,
+                        f"HTTP 429 after {MAX_RATE_LIMIT_RETRIES} retries",
                     ),
-                    "message": response.text[:1000],
-                    "order_ids": order_ids,
-                }
-            ],
-        }
+                )
+            time.sleep(retry_after_seconds(response))
+            rate_limit_retries += 1
+            continue
+        if response.status_code >= 500:
+            if server_retries == 0:
+                server_retries += 1
+                time.sleep(1)
+                continue
+            return (
+                [],
+                [],
+                technical_event(
+                    "server_error_exhausted", order_ids, response.status_code, response.text
+                ),
+            )
+        if response.status_code in {400, 401}:
+            raise RuntimeError(
+                f"Non-retryable API response {response.status_code}: {response.text[:1000]}"
+            )
+        return (
+            [],
+            [],
+            technical_event(
+                f"http_{response.status_code}", order_ids, response.status_code, response.text
+            ),
+        )
 
 
-def add_metadata(df, run_id):
-    return (
-        df
-        .withColumn(
-            "_source_system",
-            F.lit("logistics_api"),
-        )
-        .withColumn(
-            "_source_endpoint",
-            F.lit("/v1/shipments"),
-        )
-        .withColumn(
-            "_run_id",
-            F.lit(run_id),
-        )
-        .withColumn(
-            "_ingested_at",
-            F.current_timestamp(),
-        )
-    )
+def write_json_line(stream, shipment: dict[str, Any], run_id: str, batch_id: str) -> None:
+    raw_payload = json.dumps(shipment, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    output = dict(shipment)
+    output["_raw_payload"] = raw_payload
+    output["_source_batch_id"] = batch_id
+    output["_source_row_hash"] = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+    output["_source_system"] = "logistics_api"
+    output["_run_id"] = run_id
+    output["_ingested_at"] = datetime.now(UTC).isoformat()
+    stream.write(json.dumps(output, ensure_ascii=False) + "\n")
 
 
-def write_api_errors(spark, errors, run_id):
-    if not errors:
+def persist_api_events(spark, events: list[ApiEvent]) -> None:
+    if not events:
         return
-
-    rows = [
-        (
-            run_id,
-            error["error_type"],
-            error["message"],
-            json.dumps(error["order_ids"]),
-            datetime.now(timezone.utc),
-        )
-        for error in errors
-    ]
-
-    schema = StructType(
-        [
-            StructField("run_id", StringType(), False),
-            StructField(
-                "error_type",
-                StringType(),
-                False,
-            ),
-            StructField(
-                "message",
-                StringType(),
-                True,
-            ),
-            StructField(
-                "order_ids",
-                StringType(),
-                True,
-            ),
-            StructField(
-                "logged_at",
-                TimestampType(),
-                False,
-            ),
-        ]
-    )
-
-    error_df = spark.createDataFrame(
-        rows,
-        schema=schema,
-    )
-
-    target_table = "polaris.audit.api_errors"
-
-    create_namespace_if_needed(
+    frame = spark.createDataFrame([event.__dict__ for event in events], API_EVENT_SCHEMA)
+    merge_upsert(
         spark,
-        "polaris.audit",
-    )
-
-    create_table_if_needed(
-        spark=spark,
-        table_name=target_table,
-        df=error_df,
-    )
-
-    merge_condition = """
-        target.run_id = source.run_id
-        AND target.error_type = source.error_type
-        AND target.order_ids = source.order_ids
-    """
-
-    merge_into_iceberg(
-        spark=spark,
-        target_table=target_table,
-        source_df=error_df,
-        merge_condition=merge_condition,
+        frame,
+        "polaris.audit.api_events",
+        ["run_id", "start_date", "end_date", "event_type", "order_ids"],
     )
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    spark = build_spark("shopvn-api-bronze")
-
-    base_url = os.getenv(
-        "LOGISTICS_API_URL",
-        "http://api:8000",
-    )
-
-    api_key = os.getenv(
-        "LOGISTICS_API_KEY",
-        "shopvn-logistics-key-2026",
-    )
-
-    batch_size = min(
-        max(args.batch_size, 1),
-        50,
-    )
+    run_id = validate_run_id(args.run_id)
+    validate_date_range(args.start_date, args.end_date)
+    config = ApiSourceConfig.from_env()
+    spark = create_spark_session("shopvn-api-bronze")
+    landing_dir = Path(args.landing_dir)
+    landing_dir.mkdir(parents=True, exist_ok=True)
+    part_path = landing_dir / f"shipments_{run_id}.ndjson.part"
+    ready_path = landing_dir / f"shipments_{run_id}.ndjson.ready"
+    events: list[ApiEvent] = []
+    not_found_count = 0
+    shipment_count = 0
+    started = time.monotonic()
 
     try:
-        order_df = read_order_ids(
-            spark=spark,
-            args=args,
-        )
-
-        order_ids = [
-            row["order_id"]
-            for row in order_df.collect()
-            if row["order_id"] is not None
-        ]
-
-        all_shipments = []
-        all_errors = []
-
-        with requests.Session() as session:
-            for batch in chunk_values(
-                order_ids,
-                batch_size,
-            ):
-                result = call_api(
-                    session=session,
-                    base_url=base_url,
-                    api_key=api_key,
-                    order_ids=batch,
+        orders = (
+            spark.table("polaris.bronze.orders")
+            .where(
+                F.col("order_date").between(
+                    F.lit(args.start_date).cast("date"),
+                    F.lit(args.end_date).cast("date"),
                 )
-
-                all_shipments.extend(
-                    result["shipments"]
-                )
-
-                all_errors.extend(
-                    result["errors"]
-                )
-
-        write_api_errors(
-            spark=spark,
-            errors=all_errors,
-            run_id=args.run_id,
-        )
-
-        if not all_shipments:
-            print(
-                "No API shipments returned. "
-                "Bronze load skipped."
             )
-            return
-
-        shipment_df = spark.createDataFrame(
-            all_shipments,
-            schema=SHIPMENT_SCHEMA,
+            .select("order_id")
+            .dropDuplicates(["order_id"])
+            .orderBy("order_id")
         )
-
-        shipment_df = add_metadata(
-            df=shipment_df,
-            run_id=args.run_id,
-        )
-
-        target_table = "polaris.bronze.api_shipments"
-
-        create_namespace_if_needed(
+        limiter = RequestRateLimiter(config.requests_per_minute)
+        session = requests.Session()
+        batch: list[str] = []
+        batch_number = 0
+        with part_path.open("w", encoding="utf-8", newline="\n") as stream:
+            for row in orders.toLocalIterator():
+                batch.append(row["order_id"])
+                if len(batch) < BATCH_SIZE:
+                    continue
+                batch_number += 1
+                shipments, not_found, event = fetch_batch(session, limiter, config, batch)
+                batch_id = f"{run_id}.{batch_number:06d}"
+                for shipment in shipments:
+                    write_json_line(stream, shipment, run_id, batch_id)
+                shipment_count += len(shipments)
+                not_found_count += len(not_found)
+                if not_found:
+                    events.append(
+                        ApiEvent(
+                            run_id=run_id,
+                            start_date=args.start_date,
+                            end_date=args.end_date,
+                            event_type="not_found",
+                            order_ids=",".join(not_found),
+                            status_code=404,
+                            blocks_downstream=False,
+                            message="Expected order IDs without shipment",
+                            recorded_at=datetime.now(UTC).replace(tzinfo=None),
+                        )
+                    )
+                if event:
+                    event.run_id = run_id
+                    event.start_date = args.start_date
+                    event.end_date = args.end_date
+                    events.append(event)
+                batch.clear()
+            if batch:
+                batch_number += 1
+                shipments, not_found, event = fetch_batch(session, limiter, config, batch)
+                batch_id = f"{run_id}.{batch_number:06d}"
+                for shipment in shipments:
+                    write_json_line(stream, shipment, run_id, batch_id)
+                shipment_count += len(shipments)
+                not_found_count += len(not_found)
+                if not_found:
+                    events.append(
+                        ApiEvent(
+                            run_id=run_id,
+                            start_date=args.start_date,
+                            end_date=args.end_date,
+                            event_type="not_found",
+                            order_ids=",".join(not_found),
+                            status_code=404,
+                            blocks_downstream=False,
+                            message="Expected order IDs without shipment",
+                            recorded_at=datetime.now(UTC).replace(tzinfo=None),
+                        )
+                    )
+                if event:
+                    event.run_id = run_id
+                    event.start_date = args.start_date
+                    event.end_date = args.end_date
+                    events.append(event)
+        session.close()
+        os.replace(part_path, ready_path)
+        staged = spark.read.schema(SHIPMENT_SCHEMA).json(str(ready_path))
+        staged = staged.withColumn("_ingested_at", F.to_timestamp("_ingested_at"))
+        assert_unique_non_null(staged, "api_shipments", ["order_id"])
+        merge_upsert(spark, staged, "polaris.bronze.api_shipments", ["order_id"])
+        persist_api_events(spark, events)
+        technical_failures = [event for event in events if event.blocks_downstream]
+        write_run_audit(
             spark,
-            "polaris.bronze",
+            run_id=run_id,
+            stage="bronze_api",
+            object_name="api_shipments",
+            start_date=args.start_date,
+            end_date=args.end_date,
+            status="FAIL" if technical_failures else "PASS",
+            source_count=shipment_count + not_found_count,
+            target_count=shipment_count,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error=(
+                RuntimeError(f"{len(technical_failures)} exhausted API failures")
+                if technical_failures
+                else None
+            ),
         )
-
-        create_table_if_needed(
-            spark=spark,
-            table_name=target_table,
-            df=shipment_df,
-        )
-
-        merge_condition = """
-            target.order_id = source.order_id
-        """
-
-        merge_into_iceberg(
-            spark=spark,
-            target_table=target_table,
-            source_df=shipment_df,
-            merge_condition=merge_condition,
-        )
-
-        print(
-            f"API Bronze completed. "
-            f"shipments={len(all_shipments)}"
-        )
-
+        if technical_failures:
+            raise RuntimeError(
+                f"Operations publication blocked by {len(technical_failures)} API failures"
+            )
     finally:
+        part_path.unlink(missing_ok=True)
         spark.stop()
 
 

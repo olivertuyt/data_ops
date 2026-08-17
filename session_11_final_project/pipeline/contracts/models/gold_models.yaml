@@ -1,0 +1,71 @@
+contract_version: 1
+owner: data-platform
+stewards: [finance, operations, marketing, product]
+source_of_truth: DQ-approved work candidates
+freshness: published before 08:00 Asia/Ho_Chi_Minh
+storage: append-versioned Iceberg tables in gold_versions
+serving: Trino-readable Iceberg tables in the serving namespace are written only after domain DQ passes
+write_strategy: version history MERGEs by run_id plus business key; serving MERGEs by business key
+retention: version storage and publication audit 730 days
+breaking_change_policy: grain, key, measure, privacy, and semantic changes require steward review
+models:
+  fact_daily_revenue:
+    domain: finance
+    consumers: [finance]
+    grain: one row per metric_date, sales_channel, revenue_basis
+    key: [metric_date, sales_channel, revenue_basis]
+    partition: day(metric_date)
+    fields: [metric_date, channel_group, sales_channel, revenue_basis, gross_revenue, net_revenue, discount_cost, refund_amount, commission_cost, order_count, anomaly_count]
+    blocking_dq: [direct_amount_reconciliation, marketplace_amount_reconciliation, non_negative, sftp_completeness]
+  fact_customer_daily:
+    domain: customer
+    consumers: [finance, marketing, product]
+    grain: one row per metric_date and customer
+    key: [metric_date, customer_id]
+    partition: day(metric_date)
+    fields: [metric_date, customer_id, loyalty_tier, city, district, daily_net_spend, daily_order_count, customer_first_order_date, prior_order_date, last_order_date, month_to_date_spend, is_repeat_within_30_days, lifecycle_stage, days_since_last_order]
+  fact_voucher_daily:
+    domain: customer
+    consumers: [finance, marketing]
+    grain: one row per metric_date and voucher_code
+    key: [metric_date, voucher_code]
+    fields: [metric_date, voucher_code, campaign_id, usage_count, net_revenue, discount_cost, anomaly_count]
+  fact_delivery_daily:
+    domain: operations
+    consumers: [operations]
+    grain: one row per metric_date, carrier, province, failure_reason
+    key: [metric_date, carrier, recipient_province, failure_reason]
+    fields: [metric_date, carrier, recipient_province, failure_reason, order_count, shipment_count, delivered_count, failed_count, redelivery_count, avg_delivery_hours]
+  fact_return_daily:
+    domain: operations
+    consumers: [operations, product]
+    grain: one row per metric_date, category, sales_channel
+    key: [metric_date, category, sales_channel]
+    fields: [metric_date, category, sales_channel, sold_units, returned_units, return_rate]
+  fact_product_rating_daily:
+    domain: customer
+    consumers: [marketing, product]
+    grain: one row per metric_date, category, direct sales_channel
+    key: [metric_date, category, sales_channel]
+    fields: [metric_date, category, sales_channel, average_rating, review_count]
+    limitation: marketplace ratings do not exist and are never fabricated
+    empty_window_policy: a valid window with no direct reviews publishes zero rows
+  fact_inventory_eod:
+    domain: product
+    consumers: [product, operations]
+    grain: one row per snapshot_date, product_id, warehouse_id
+    key: [snapshot_date, product_id, warehouse_id]
+    fields: [snapshot_date, product_id, warehouse_id, eod_stock_qty]
+  fact_product_channel_daily:
+    domain: product
+    consumers: [product, finance]
+    grain: one row per metric_date, product_id, sales_channel
+    key: [metric_date, product_id, sales_channel]
+    fields: [metric_date, product_id, sales_channel, units_sold, net_revenue, category, cost_price, is_loss_making_catalog, current_stock_qty, average_net_unit_price, is_selling_at_loss, avg_daily_units_sold_7d, days_to_stockout]
+  dim_customer_scd2:
+    domain: customer
+    consumers: [marketing]
+    grain: one row per customer loyalty-tier version
+    key: [customer_version_key]
+    fields: [customer_id, loyalty_tier, attribute_hash, effective_from, effective_to, is_current, customer_version_key]
+    history_start: PIPELINE_GO_LIVE_DATE; no tier history is fabricated before go-live

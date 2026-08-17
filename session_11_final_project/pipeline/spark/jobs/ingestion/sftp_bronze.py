@@ -1,371 +1,318 @@
-import hashlib, os, paramiko
+"""Stream, verify, audit, and ingest raw marketplace CSV files from SFTP."""
+
+from __future__ import annotations
+
 import argparse
-from datetime import date, datetime, timedelta
+import csv
+import hashlib
+import os
+import time
+from dataclasses import asdict, dataclass
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
-from pyspark.sql import SparkSession, functions as F, types as T
+import paramiko
+from common.audit import write_run_audit
+from common.config import SftpSourceConfig, validate_date_range, validate_run_id
+from common.iceberg import merge_upsert
 from common.spark_session import create_spark_session
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
 
-PARTNERS = ["lazada", "shopee", "tiktok"]
-
-CSV_SCHEMA = T.StructType([
-    T.StructField("external_order_id", T.StringType(), True),
-    T.StructField("shopvn_product_id", T.IntegerType(), True),
-    T.StructField("seller_sku", T.StringType(), True),
-    T.StructField("partner", T.StringType(), True),
-    T.StructField("order_date", T.StringType(), True),
-    T.StructField("quantity_sold", T.IntegerType(), True),
-    T.StructField("sale_price", T.IntegerType(), True),
-    T.StructField("platform_discount", T.IntegerType(), True),
-    T.StructField("commission_rate", T.DoubleType(), True),
-    T.StructField("net_revenue", T.IntegerType(), True),
-    T.StructField("settlement_date", T.StringType(), True),
-    T.StructField("status", T.StringType(), True),
-])
-
-REQUIRED_COLUMNS = [field.name for field in CSV_SCHEMA.fields]
-KEY_COLUMNS = ["partner", "external_order_id", "shopvn_product_id", "order_date"]
-
-def md5_stream(path):
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def download_file(sftp, remote, local):
-    tmp = local + ".part"
-    sftp.get(remote, tmp)
-    os.replace(tmp, local)
-
-def read_expected_md5(path: str) -> str:
-    with open(path, encoding="utf-8") as handle:
-        return handle.read().strip().split()[0].lower()
-
-def verify_md5(csv_path, md5_path):
-    expected = open(md5_path, encoding = "utf-8").read().strip().split()[0]
-    actual = md5_stream(csv_path)
-    return expected.lower() == actual.lower(), expected, actual
-
-def connect_sftp():
-    host = os.getenv("SFTP_HOST", "sftp")
-    port = int(os.getenv("SFTP_PORT", "22"))
-    username = os.getenv("SFTP_USER", "marketplace_reader")
-    password = os.getenv("SFTP_PASSWORD", "sftp_readonly_2026")
-
-    transport = paramiko.Transport((host, port))
-    transport.connect(username=username, password=password)
-    return transport, paramiko.SFTPClient.from_transport(transport)
-
-def remote_exists(sftp, path: str) -> bool:
-    try:
-        sftp.stat(path)
-        return True
-    except FileNotFoundError:
-        return False
-    except IOError:
-        return False
-
-def download_atomic(sftp, remote_path: str, local_path: str):
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    part_path = local_path + ".part"
-
-    if os.path.exists(part_path):
-        os.remove(part_path)
-
-    sftp.get(remote_path, part_path)
-    os.replace(part_path, local_path)
-
-def parse_date(value: str) -> date:
-    return datetime.strptime(value, "%Y-%m-%d").date()
-
-def date_range(start: date, end: date):
-    current = start
-    while current <= end:
-        yield current
-        current += timedelta(days = 1)
-
-def collect_files_from_sftp(args):
-    transport, sftp = connect_sftp()
-    manifest = []
-    valid_ready_paths = []
-
-    try:
-        for partner in PARTNERS:
-            for business_date in date_range(parse_date(args.start_date), parse_date(args.end_date)):
-                ymd = business_date.strftime("%Y%m%d")
-                file_name = f"{partner}_{ymd}.csv"
-                md5_name = f"{file_name}.md5"
-
-                remote_csv = f"{args.remote_base_dir}/{partner}/{file_name}"
-                remote_md5 = f"{args.remote_base_dir}/{partner}/{md5_name}"
-
-                local_dir = os.path.join(args.landing_dir, partner, business_date.isoformat())
-                local_csv = os.path.join(local_dir, file_name)
-                local_md5 = os.path.join(local_dir, md5_name)
-                ready_path = local_csv + ".ready"
-
-                record = {
-                    "source_system": "sftp",
-                    "partner": partner,
-                    "business_date": business_date.isoformat(),
-                    "file_name": file_name,
-                    "remote_path": remote_csv,
-                    "local_path": ready_path,
-                    "expected_md5": None,
-                    "actual_md5": None,
-                    "file_size_bytes": None,
-                    "status": None,
-                    "error_message": None,
-                    "run_id": args.run_id,
-                    "checked_at": datetime.utcnow().isoformat(),
-                }
-
-                if not remote_exists(sftp, remote_csv) or not remote_exists(sftp, remote_md5):
-                    record["status"] = "MISSING"
-                    record["error_message"] = "CSV or MD5 file is missing"
-                    manifest.append(record)
-                    continue
-
-                try:
-                    download_atomic(sftp, remote_csv, local_csv)
-                    download_atomic(sftp, remote_md5, local_md5)
-
-                    expected = read_expected_md5(local_md5)
-                    actual = md5_stream(local_csv)
-
-                    record["expected_md5"] = expected
-                    record["actual_md5"] = actual
-                    record["file_size_bytes"] = os.path.getsize(local_csv)
-
-                    if expected != actual:
-                        record["status"] = "CORRUPTED"
-                        record["error_message"] = f"MD5 mismatch: expected {expected}, got {actual}"
-                        manifest.append(record)
-                        continue
-
-                    os.replace(local_csv, ready_path)
-                    record["status"] = "VALID"
-                    manifest.append(record)
-                    valid_ready_paths.append(ready_path)
-
-                except Exception as e:
-                    record["status"] = "ERROR"
-                    record["error_message"] = str(e)
-                    manifest.append(record)
-    finally:
-        sftp.close()
-        transport.close()
-    return manifest, valid_ready_paths
-
-def write_manifest(spark, manifest):
-    spark.sql("CREATE NAMEPSACE IF NOT EXISTS polaris.audit")
-
-    schema = T.StructType([
-        T.StructField("source_system", T.StringType(), False),
-        T.StructField("partner", T.StringType(), True),
-        T.StructField("business_date", T.StringType(), True),
-        T.StructField("file_name", T.StringType(), True),
-        T.StructField("remote_path", T.StringType(), True),
-        T.StructField("local_path", T.StringType(), True),
+RAW_COLUMNS = (
+    "external_order_id",
+    "shopvn_product_id",
+    "seller_sku",
+    "partner",
+    "order_date",
+    "quantity_sold",
+    "sale_price",
+    "platform_discount",
+    "commission_rate",
+    "net_revenue",
+    "settlement_date",
+    "status",
+)
+RAW_SCHEMA = T.StructType([T.StructField(column, T.StringType(), True) for column in RAW_COLUMNS])
+MANIFEST_SCHEMA = T.StructType(
+    [
+        T.StructField("run_id", T.StringType(), False),
+        T.StructField("partner", T.StringType(), False),
+        T.StructField("business_date", T.StringType(), False),
+        T.StructField("file_name", T.StringType(), False),
+        T.StructField("remote_path", T.StringType(), False),
+        T.StructField("ready_path", T.StringType(), False),
+        T.StructField("status", T.StringType(), False),
         T.StructField("expected_md5", T.StringType(), True),
         T.StructField("actual_md5", T.StringType(), True),
-        T.StructField("file_size_bytes", T.LongType(), True),
-        T.StructField("status", T.StringType(), True),
+        T.StructField("byte_count", T.LongType(), True),
+        T.StructField("extra_columns", T.StringType(), True),
         T.StructField("error_message", T.StringType(), True),
-        T.StructField("run_id", T.StringType(), False),
-        T.StructField("checked_at", T.StringType(), False),
-    ])
+        T.StructField("checked_at", T.TimestampType(), False),
+    ]
+)
 
-    df = spark.createDataFrame(manifest, schema=schema)
-    df = df.withColumn("business_date", F.to_date("business_date"))
-    df = df.withColumn("checked_at", F.to_timestamp("checked_at"))
 
-    spark.sql("""
-        CREATE TABLE IF NOT EXISTS polaris.audit.source_manifests (
-            source_system STRING,
-            partner STRING,
-            business_date DATE,
-            file_name STRING,
-            remote_path STRING,
-            local_path STRING,
-            expected_md5 STRING,
-            actual_md5 STRING,
-            file_size_bytes BIGINT,
-            status STRING,
-            error_message STRING,
-            run_id STRING,
-            checked_at TIMESTAMP
-        )
-        USING iceberg
-    """)
+@dataclass
+class ManifestRecord:
+    run_id: str
+    partner: str
+    business_date: str
+    file_name: str
+    remote_path: str
+    ready_path: str
+    status: str
+    expected_md5: str | None = None
+    actual_md5: str | None = None
+    byte_count: int | None = None
+    extra_columns: str | None = None
+    error_message: str | None = None
 
-    df.writeTo("polaris.audit.source_manifests").append()
 
-def read_valid_csv_files(spark, paths, run_id):
-    df = spark.read.option("header", "true").schema(CSV_SCHEMA).csv(paths)
-
-    return (
-        df.withColumn("order_date", F.to_date("order_date"))
-          .withColumn("settlement_date", F.to_date("settlement_date"))
-          .withColumn("_source_system", F.lit("sftp"))
-          .withColumn("_source_file", F.input_file_name())
-          .withColumn("_run_id", F.lit(run_id))
-          .withColumn("_ingested_at", F.current_timestamp())
-    )
-
-def validate_marketplace_df(df):
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    for col_name in KEY_COLUMNS:
-        null_count = df.filter(F.col(col_name).isNull()).count()
-        if null_count > 0:
-            raise ValueError(f"Column {col_name} has {null_count} null values")
-
-    duplicate_count = ( df.groupBy(*KEY_COLUMNS).count().filter("count > 1").count() )
-    if duplicate_count > 0:
-        raise ValueError(f"Found {duplicate_count} duplicate rows based on key columns: {KEY_COLUMNS}")
-
-    invalid_partner_count = df.filter(~F.col("partner").isin(PARTNERS)).count()
-    if invalid_partner_count > 0:
-        raise RuntimeError(f"Invalid partner values: {invalid_partner_count}")
-
-    invalid_status_count = df.filter(~F.col("status").isin("completed", "returned", "disputed")).count()
-    if invalid_status_count > 0:
-        raise RuntimeError(f"Invalid status values: {invalid_status_count}")
-
-def merge_marketplace_bronze(spark, df):
-    spark.sql("CREATE NAMESPACE IF NOT EXISTS polaris.bronze")
-
-    df.createOrReplaceTempView("marketplace_sales_stage")
-
-    spark.sql("""
-        CREATE TABLE IF NOT EXISTS polaris.bronze.marketplace_sales (
-            external_order_id STRING,
-            shopvn_product_id INT,
-            seller_sku STRING,
-            partner STRING,
-            order_date DATE,
-            quantity_sold INT,
-            sale_price INT,
-            platform_discount INT,
-            commission_rate DOUBLE,
-            net_revenue INT,
-            settlement_date DATE,
-            status STRING,
-            _source_system STRING,
-            _source_file STRING,
-            _run_id STRING,
-            _ingested_at TIMESTAMP
-        )
-        USING iceberg
-        PARTITIONED BY (days(order_date), partner)
-    """)
-
-    spark.sql("""
-        MERGE INTO polaris.bronze.marketplace_sales AS target
-        USING marketplace_sales_stage AS source
-        ON target.partner = source.partner
-        AND target.external_order_id = source.external_order_id
-        AND target.shopvn_product_id = source.shopvn_product_id
-        AND target.order_date = source.order_date
-
-        WHEN MATCHED THEN UPDATE SET
-            target.seller_sku = source.seller_sku,
-            target.quantity_sold = source.quantity_sold,
-            target.sale_price = source.sale_price,
-            target.platform_discount = source.platform_discount,
-            target.commission_rate = source.commission_rate,
-            target.net_revenue = source.net_revenue,
-            target.settlement_date = source.settlement_date,
-            target.status = source.status,
-            target._source_system = source._source_system,
-            target._source_file = source._source_file,
-            target._run_id = source._run_id,
-            target._ingested_at = source._ingested_at
-
-        WHEN NOT MATCHED THEN INSERT (
-            external_order_id,
-            shopvn_product_id,
-            seller_sku,
-            partner,
-            order_date,
-            quantity_sold,
-            sale_price,
-            platform_discount,
-            commission_rate,
-            net_revenue,
-            settlement_date,
-            status,
-            _source_system,
-            _source_file,
-            _run_id,
-            _ingested_at
-        )
-        VALUES (
-            source.external_order_id,
-            source.shopvn_product_id,
-            source.seller_sku,
-            source.partner,
-            source.order_date,
-            source.quantity_sold,
-            source.sale_price,
-            source.platform_discount,
-            source.commission_rate,
-            source.net_revenue,
-            source.settlement_date,
-            source.status,
-            source._source_system,
-            source._source_file,
-            source._run_id,
-            source._ingested_at
-        )
-    """)
-
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
-    parser.add_argument("--remote-base-dir", default="/marketplace/incoming")
-    parser.add_argument("--landing-dir", default="/tmp/shopvn/landing/marketplace")
-    args = parser.parse_args()
+    parser.add_argument("--landing-dir", required=True)
+    return parser.parse_args()
 
-    spark = create_spark_session("sftp-bronze")
 
-    manifest, valid_paths = collect_files_from_sftp(args)
-    write_manifest(spark, manifest)
+def iter_dates(start: date, end: date):
+    current = start
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
 
-    valid_count = sum(1 for row in manifest if row["status"] == "VALID")
-    corrupt_count = sum(r["status"] == "CORRUPTED" for r in manifest)   
-    missing_count = sum(1 for row in manifest if row["status"] == "MISSING")
-    error_count = sum(1 for row in manifest if row["status"] == "ERROR")
 
-    print(
-        f"SFTP manifest: valid={valid_count}, "
-        f"missing={missing_count}, corrupt={corrupt_count}, error={error_count}"
+def remote_exists(sftp: paramiko.SFTPClient, path: str) -> bool:
+    try:
+        sftp.stat(path)
+        return True
+    except OSError:
+        return False
+
+
+def download_streamed(
+    sftp: paramiko.SFTPClient, remote_path: str, local_path: Path
+) -> tuple[str, int]:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path = local_path.with_name(local_path.name + ".part")
+    # The partner contract mandates MD5 for transport integrity, not security.
+    digest = hashlib.md5(usedforsecurity=False)
+    byte_count = 0
+    try:
+        with sftp.open(remote_path, "rb") as source, part_path.open("wb") as target:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                target.write(chunk)
+                digest.update(chunk)
+                byte_count += len(chunk)
+        os.replace(part_path, local_path)
+    except Exception:
+        part_path.unlink(missing_ok=True)
+        raise
+    return digest.hexdigest(), byte_count
+
+
+def read_remote_checksum(sftp: paramiko.SFTPClient, path: str) -> str:
+    with sftp.open(path, "r") as stream:
+        raw = stream.read()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    value = raw.strip().split()[0].lower()
+    if len(value) != 32 or any(char not in "0123456789abcdef" for char in value):
+        raise RuntimeError(f"Invalid MD5 companion file for {Path(path).name}")
+    return value
+
+
+def validate_csv_header(path: Path) -> tuple[str, ...]:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        header = next(csv.reader(stream), None)
+    if header is None:
+        raise RuntimeError(f"Empty CSV file: {path.name}")
+    missing = sorted(set(RAW_COLUMNS) - set(header))
+    if missing:
+        raise RuntimeError(f"Missing required CSV columns in {path.name}: {missing}")
+    return tuple(sorted(set(header) - set(RAW_COLUMNS)))
+
+
+def connect_sftp(config: SftpSourceConfig):
+    last_error = None
+    for attempt, delay in enumerate((1, 2, 4), start=1):
+        try:
+            transport = paramiko.Transport((config.host, config.port))
+            transport.connect(username=config.user, password=config.password)
+            return transport, paramiko.SFTPClient.from_transport(transport)
+        except (OSError, paramiko.SSHException) as exc:
+            last_error = exc
+            if attempt == 3:
+                break
+            time.sleep(delay)
+    raise RuntimeError("SFTP connection failed after bounded retries") from last_error
+
+
+def collect_files(
+    args: argparse.Namespace, config: SftpSourceConfig
+) -> tuple[list[ManifestRecord], list[str]]:
+    start, end = validate_date_range(args.start_date, args.end_date)
+    transport, sftp = connect_sftp(config)
+    manifests: list[ManifestRecord] = []
+    ready_files: list[str] = []
+    try:
+        for partner in config.partners:
+            for business_date in iter_dates(start, end):
+                file_name = f"{partner}_{business_date:%Y%m%d}.csv"
+                remote_path = f"{config.remote_base_dir}/{partner}/{file_name}"
+                ready_path = (
+                    Path(args.landing_dir)
+                    / partner
+                    / business_date.isoformat()
+                    / f"{file_name}.ready"
+                )
+                record = ManifestRecord(
+                    run_id=args.run_id,
+                    partner=partner,
+                    business_date=business_date.isoformat(),
+                    file_name=file_name,
+                    remote_path=remote_path,
+                    ready_path=str(ready_path),
+                    status="PENDING",
+                )
+                if not remote_exists(sftp, remote_path) or not remote_exists(
+                    sftp, f"{remote_path}.md5"
+                ):
+                    record.status = "MISSING"
+                    record.error_message = "CSV or companion MD5 file is missing"
+                    manifests.append(record)
+                    continue
+                try:
+                    record.expected_md5 = read_remote_checksum(sftp, f"{remote_path}.md5")
+                    download_path = ready_path.with_suffix("")
+                    record.actual_md5, record.byte_count = download_streamed(
+                        sftp, remote_path, download_path
+                    )
+                    if record.actual_md5 != record.expected_md5:
+                        download_path.unlink(missing_ok=True)
+                        record.status = "CORRUPT"
+                        record.error_message = "MD5 checksum mismatch"
+                    else:
+                        extra_columns = validate_csv_header(download_path)
+                        record.extra_columns = ",".join(extra_columns) or None
+                        ready_path.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(download_path, ready_path)
+                        record.status = "VALID"
+                        ready_files.append(str(ready_path))
+                except Exception as exc:
+                    record.status = "ERROR"
+                    record.error_message = str(exc)[:4000]
+                manifests.append(record)
+    finally:
+        sftp.close()
+        transport.close()
+    return manifests, ready_files
+
+
+def write_manifests(spark, records: list[ManifestRecord]) -> None:
+    rows = []
+    for record in records:
+        item = asdict(record)
+        item["checked_at"] = datetime.now(UTC).replace(tzinfo=None)
+        rows.append(item)
+    frame = spark.createDataFrame(rows, MANIFEST_SCHEMA)
+    merge_upsert(
+        spark,
+        frame,
+        "polaris.audit.source_manifests",
+        ["run_id", "partner", "business_date", "file_name"],
     )
 
-    if corrupt_count > 0 or error_count > 0:
-        raise RuntimeError("Blocking SFTP ingestion because corrupt/error files were detected")
 
-    if not valid_paths:
-        print("No valid SFTP files found. Manifest was written; Bronze load skipped.")
+def ingest_ready_files(spark, ready_files: list[str], run_id: str) -> int:
+    if not ready_files:
+        return 0
+    # input_file_name() is marked non-deterministic by Spark and makes Iceberg MERGE
+    # reject the source plan. Bind each already-verified file path as a literal so
+    # source identity remains deterministic and safe to replay.
+    raw = None
+    for ready_file in ready_files:
+        file_frame = (
+            spark.read.option("header", "true")
+            .schema(RAW_SCHEMA)
+            .csv(ready_file)
+            .withColumn("_source_file", F.lit(ready_file))
+        )
+        raw = file_frame if raw is None else raw.unionByName(file_frame)
+    if raw is None:
+        raise RuntimeError("Ready-file ingestion received no readable files")
+    staged = (
+        raw.withColumn(
+            "_source_row_hash",
+            F.sha2(
+                F.concat_ws(
+                    "\u001f",
+                    *[F.coalesce(F.col(name), F.lit("")) for name in RAW_COLUMNS],
+                ),
+                256,
+            ),
+        )
+        .withColumn("_source_system", F.lit("sftp"))
+        .withColumn("_run_id", F.lit(run_id))
+        .withColumn("_ingested_at", F.current_timestamp())
+        .dropDuplicates(["_source_file", "_source_row_hash"])
+    )
+    source_count = staged.count()
+    merge_upsert(
+        spark,
+        staged,
+        "polaris.bronze.marketplace_sales",
+        ["_source_file", "_source_row_hash"],
+    )
+    return source_count
+
+
+def main() -> None:
+    args = parse_args()
+    args.run_id = validate_run_id(args.run_id)
+    validate_date_range(args.start_date, args.end_date)
+    config = SftpSourceConfig.from_env()
+    started = time.monotonic()
+    manifests, ready_files = collect_files(args, config)
+    spark = create_spark_session("shopvn-sftp-bronze")
+    try:
+        write_manifests(spark, manifests)
+        loaded = ingest_ready_files(spark, ready_files, args.run_id)
+        integrity_failures = [
+            record for record in manifests if record.status in {"CORRUPT", "ERROR"}
+        ]
+        write_run_audit(
+            spark,
+            run_id=args.run_id,
+            stage="bronze_sftp",
+            object_name="marketplace_sales",
+            start_date=args.start_date,
+            end_date=args.end_date,
+            status="FAIL" if integrity_failures else "PASS",
+            source_count=loaded,
+            target_count=(
+                spark.table("polaris.bronze.marketplace_sales").count() if ready_files else 0
+            ),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error=(
+                RuntimeError(f"{len(integrity_failures)} SFTP integrity failures")
+                if integrity_failures
+                else None
+            ),
+        )
+        if integrity_failures:
+            raise RuntimeError(
+                "Checksum/schema failures were quarantined; affected domain publication is blocked"
+            )
+    finally:
         spark.stop()
-        return
-
-    df = read_valid_csv_files(spark, valid_paths, args.run_id)
-    validate_marketplace_df(df)
-    merge_marketplace_bronze(spark, df)
-
-    loaded_count = df.count()
-    print(f"Loaded marketplace Bronze rows: {loaded_count}")
-
-    spark.stop()
 
 
 if __name__ == "__main__":
     main()
-
-

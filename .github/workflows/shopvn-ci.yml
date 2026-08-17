@@ -1,0 +1,42 @@
+name: shopvn-final-project-ci
+
+on:
+  pull_request:
+    paths: ["session_11_final_project/**", ".github/workflows/shopvn-ci.yml"]
+  push:
+    branches: [main]
+    paths: ["session_11_final_project/**", ".github/workflows/shopvn-ci.yml"]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: session_11_final_project/pipeline
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: session_11_final_project/pipeline/requirements.txt
+      - name: Install pinned dependencies
+        run: >-
+          pip install
+          --constraint https://raw.githubusercontent.com/apache/airflow/constraints-2.9.3/constraints-3.11.txt
+          -r requirements.txt
+      - name: Format and lint
+        run: |
+          ruff format --check .
+          ruff check .
+      - name: Static and security checks
+        run: |
+          python -m compileall -q spark dags monitoring tests scripts
+          python scripts/check_for_secrets.py
+          bandit -q -r spark dags monitoring
+      - name: Unit, contract, model, and DAG tests
+        run: pytest
+      - name: Validate Compose
+        run: docker compose --env-file config/version.env --env-file .env.example config --quiet
+      - name: Build immutable pipeline image
+        run: docker compose --env-file config/version.env --env-file .env.example build airflow-scheduler

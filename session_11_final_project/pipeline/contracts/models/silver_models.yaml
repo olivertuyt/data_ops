@@ -1,0 +1,60 @@
+contract_version: 1
+owner: data-platform
+source_of_truth: checksum/schema-valid Bronze tables
+consumers: Gold candidate builders and DQ jobs only
+freshness: daily before Gold publication and 08:00 Asia/Ho_Chi_Minh
+access: restricted data-platform role; no analyst access
+retention: 730 days with Iceberg snapshots retained for replay and incident evidence
+write_strategy: deterministic primary/business-key MERGE
+schema_evolution: explicit projection; missing/type/semantic changes fail before write
+privacy:
+  direct_identifiers: stable salted SHA-256 hashes
+  retained_location: city and district
+  removed_from_silver: [full_name, phone, email, ward, product_reviews.comment]
+models:
+  customers:
+    grain: one row per customer
+    key: [customer_id]
+    fields: [customer_id, full_name_hash, phone_hash, email_hash, city, district, gender, date_of_birth, loyalty_tier, created_at, is_phone_missing]
+  products:
+    grain: one row per product
+    key: [product_id]
+    fields: [product_id, name, category, subcategory, brand, sku, base_price, cost_price, weight_gram, is_active, created_at, is_loss_making]
+  returns:
+    grain: one row per return request
+    key: [return_id]
+    fields: [return_id, order_id, reason, return_status, refund_amount, created_at]
+  direct_orders:
+    grain: one row per direct order
+    key: [order_id]
+    fields: [order_id, customer_id, voucher_code, channel, order_date, order_status, subtotal, shipping_fee, discount_amount, total_amount, payment_status, refunded_amount, is_zero_shipping_anomaly, is_discount_anomaly, is_revenue_eligible, eligible_net_revenue]
+    revenue_rule: non-cancelled plus payment paid/refunded plus no discount anomaly; deduct only refunded returns and clamp at zero
+  order_items:
+    grain: one row per source line
+    key: [item_id]
+    fields: [item_id, order_id, product_id, quantity, unit_price, discount_per_item, total_price, is_zero_quantity, eligible_quantity, eligible_item_revenue]
+  vouchers:
+    grain: one row per voucher
+    key: [voucher_code]
+    fields: [voucher_code, voucher_type, value, min_order_value, max_discount, campaign_id, valid_from, valid_to, usage_count, max_usage, is_usage_over_limit]
+  inventory:
+    grain: one row per product and warehouse
+    key: [product_id, warehouse_id]
+    fields: [product_id, warehouse_id, stock_qty, last_updated, is_negative_stock]
+  inventory_transactions:
+    grain: one row per movement
+    key: [txn_id]
+    fields: [txn_id, product_id, order_id, transaction_type, qty_change, transaction_at]
+  product_reviews:
+    grain: one row per review
+    key: [review_id]
+    fields: [review_id, order_id, product_id, customer_id, rating, has_comment, created_at]
+  api_shipments:
+    grain: one row per shipped order
+    key: [order_id]
+    fields: [order_id, carrier, tracking_code, shipment_status, actual_shipping_fee, shipped_at, actual_delivery_at, estimated_delivery_date, recipient_province, recipient_district, delivery_attempts, failure_reason]
+  marketplace_sales:
+    grain: one row per partner, external order, product, order date
+    key: [partner, external_order_id, shopvn_product_id, order_date]
+    fields: [external_order_id, shopvn_product_id, seller_sku, partner, order_date, quantity_sold, sale_price, platform_discount, commission_rate, net_revenue, settlement_date, marketplace_status, calculated_net_revenue, is_net_revenue_mismatch, is_revenue_eligible]
+

@@ -1,0 +1,12 @@
+pyspark==3.5.1
+apache-airflow==2.9.3
+requests==2.31.0
+paramiko==3.4.0
+apache-airflow-providers-trino==5.7.2
+trino==0.329.0
+streamlit==1.48.0
+pandas==2.1.4
+PyYAML==6.0.1
+pytest==7.4.4
+ruff==0.3.3
+bandit==1.8.6

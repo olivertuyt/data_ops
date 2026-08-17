@@ -1,0 +1,45 @@
+contract_version: 1
+dataset: marketplace_sales_files
+owner: finance
+technical_owner: data-platform
+source_of_truth: Partner SFTP daily exports
+purpose: Marketplace earned revenue, commission, discounts, settlement, and product sales.
+connection: SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASSWORD environment variables
+timezone: Asia/Ho_Chi_Minh
+freshness: daily partner files before the 02:00 pipeline; Gold due before 08:00
+grain: one row per partner, external_order_id, shopvn_product_id, order_date
+key: [partner, external_order_id, shopvn_product_id, order_date]
+partitioning: business date and partner
+partners: configured by SFTP_PARTNERS; defaults are supplied only in .env.example
+file_pattern: /marketplace/incoming/{partner}/{partner}_YYYYMMDD.csv
+integrity: companion .md5 is mandatory; files stream in 1 MiB chunks
+failure_policy:
+  missing: audit and ingest other valid files; block dependent domain at pre-Gold completeness gate
+  corrupt: quarantine and fail SFTP branch after valid files are safely merged
+  late: rerun only the affected date; do not advance publication without completeness
+  malformed_or_missing_required_column: quarantine and fail
+schema:
+  external_order_id: {type: string, nullable: false}
+  shopvn_product_id: {type: integer, nullable: false}
+  seller_sku: {type: string, nullable: false}
+  partner: {type: string, nullable: false}
+  order_date: {type: date, nullable: false}
+  quantity_sold: {type: integer, nullable: false, unit: units}
+  sale_price: {type: integer, nullable: false, unit: VND}
+  platform_discount: {type: integer, nullable: false, unit: VND}
+  commission_rate: {type: decimal, nullable: false, unit: ratio}
+  net_revenue:
+    type: integer
+    nullable: false
+    unit: VND
+    semantic: floor of binary-float sale_price * quantity_sold * (1 - commission_rate), matching source export generation
+  settlement_date: {type: date, nullable: false, semantic: order_date plus 15 days}
+  status: {type: string, nullable: false, allowed: [completed, returned, disputed]}
+schema_evolution:
+  additive_nullable: ignore in typed Bronze after recording extra_columns; review before Silver adoption
+  missing_required_or_incompatible: quarantine and block
+retention: valid landing files 30 days; Bronze and manifest 365 days; quarantine 90 days
+delete_semantics: corrected file with a new checksum supersedes natural keys through deterministic MERGE
+dq:
+  blocking: [checksum_mismatch, missing_required_column, null_key, duplicate_key, net_revenue_formula]
+  warning: [missing_file, extra_column, late_file]
